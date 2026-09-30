@@ -1,0 +1,321 @@
+"""The presenced daemon: senses presence and publishes it on the session bus."""
+import argparse
+import asyncio
+import logging
+import os
+import signal
+import sys
+import time
+
+from dbus_fast import BusType, MessageType, Variant
+from dbus_fast.aio import MessageBus
+from dbus_fast.constants import NameFlag, PropertyAccess, RequestNameReply
+from dbus_fast.service import ServiceInterface, dbus_property, method
+from dbus_fast.service import signal as dbus_signal
+
+from . import __version__
+from .config import ConfigError, load
+from .controls import Controls
+from .desktop import Desktop, call
+from .ir import IRCamera, NoCamera
+from .monitor import Monitor, State
+from .sonar import NoSonar, Sonar
+from .wake import Waker
+
+log = logging.getLogger("presenced")
+
+BUS_NAME = "io.github.mishan.Presenced"
+OBJECT_PATH = "/io/github/mishan/Presenced"
+INTERFACE = "io.github.mishan.Presenced1"
+
+SUSPEND_GAP = 5.0  # seconds of boot time the monotonic clock missed: we were asleep
+
+
+class PresenceInterface(ServiceInterface):
+    """io.github.mishan.Presenced1, as seen by presencectl, tray icons and scripts."""
+
+    def __init__(self, daemon):
+        super().__init__(INTERFACE)
+        self.daemon = daemon
+
+    @dbus_property(access=PropertyAccess.READ)
+    def State(self) -> "s":
+        return self.daemon.monitor.state.value
+
+    @dbus_property(access=PropertyAccess.READ)
+    def StateSince(self) -> "d":
+        return self.daemon.state_since
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Sensing(self) -> "s":
+        return self.daemon.mode
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Paused(self) -> "b":
+        return self.daemon.controls.paused
+
+    @dbus_property(access=PropertyAccess.READ)
+    def PausedUntil(self) -> "d":
+        until = self.daemon.controls.paused_until
+        return 0.0 if until is None or until == float("inf") else until
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Inhibitors(self) -> "a(uss)":
+        return [[cookie, held.who, held.why] for cookie, held in self.daemon.controls.inhibitors.items()]
+
+    @method()
+    def Pause(self, seconds: "d"):
+        self.daemon.pause(seconds)
+
+    @method()
+    def Resume(self):
+        self.daemon.resume()
+
+    @method()
+    def Inhibit(self, who: "s", why: "s") -> "u":
+        return self.daemon.inhibit(who, why)
+
+    @method()
+    def Uninhibit(self, cookie: "u") -> "b":
+        return self.daemon.uninhibit(cookie)
+
+    @method()
+    def GetStatus(self) -> "a{sv}":
+        return self.daemon.status()
+
+    @dbus_signal()
+    def StateChanged(self, state) -> "s":
+        return state
+
+
+class Daemon:
+    def __init__(self, config, monitor=None, waker=None):
+        self.config = config
+        self.controls = Controls()
+        self.mode = "starting"
+        self.state_since = time.time()
+        self.idle_seconds = None
+        self.was_locked = False
+        self.sender = None  # unique name of the caller of the method being handled
+        self.poke = asyncio.Event()
+        self.stop = asyncio.Event()
+        self.last_paused = False
+        sonar, camera = config.sonar, config.camera
+        self.monitor = monitor or Monitor(
+            Sonar(sonar.tone_hz, sonar.burst, sonar.speaker, sonar.microphone) if sonar.enabled else NoSonar(),
+            IRCamera(camera.device, camera.score_threshold, camera.min_face_width) if camera.enabled else NoCamera(),
+            sonar.threshold_db,
+            config.sensing.quiet_for,
+            config.sensing.recheck_after,
+        )
+        self.monitor.on_change = self.state_changed
+        self.waker = waker or Waker(config.wake.command)
+        self.sleep_offset = self.boot_offset()
+
+    @staticmethod
+    def boot_offset():
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+
+    # called from the sensing thread as well as the event loop
+    def state_changed(self, state):
+        self.loop.call_soon_threadsafe(self.announce, state)
+
+    def announce(self, state):
+        self.state_since = time.time()
+        self.interface.StateChanged(state.value)
+        self.interface.emit_properties_changed({"State": state.value, "StateSince": self.state_since})
+        command = self.config.actions.on_away if state is State.AWAY else self.config.actions.on_present
+        if command:
+            asyncio.ensure_future(self.run_action(command, state))
+
+    async def run_action(self, command, state):
+        # presenced itself runs outside the desktop session (under systemd, or
+        # from a terminal elsewhere), so a bare `loginctl lock-session` would
+        # lock the wrong one: tell the command which session is the desktop
+        session_id, _ = await self.desktop.session()
+        env = dict(os.environ, PRESENCED_STATE=state.value, PRESENCED_SESSION=session_id or "")
+        process = await asyncio.create_subprocess_shell(command, env=env)
+        code = await process.wait()
+        if code:
+            log.warning("%s action exited with status %d: %s", state.value, code, command)
+
+    def set_mode(self, mode):
+        if mode != self.mode:
+            self.mode = mode
+            log.info("sensing: %s", mode)
+            self.interface.emit_properties_changed({"Sensing": mode})
+
+    def controls_changed(self):
+        self.last_paused = self.controls.paused
+        self.interface.emit_properties_changed(
+            {
+                "Paused": self.controls.paused,
+                "PausedUntil": self.interface.PausedUntil,
+                "Inhibitors": self.interface.Inhibitors,
+            }
+        )
+        self.poke.set()
+
+    def pause(self, seconds):
+        self.controls.pause(seconds)
+        log.info("paused %s", f"for {seconds:g} s" if seconds > 0 else "until resumed")
+        self.controls_changed()
+
+    def resume(self):
+        self.controls.resume()
+        log.info("resumed")
+        self.controls_changed()
+
+    def inhibit(self, who, why):
+        cookie = self.controls.inhibit(self.sender, who, why)
+        log.info("inhibited by %s (%s): %s", who, self.sender, why)
+        self.controls_changed()
+        return cookie
+
+    def uninhibit(self, cookie):
+        released = self.controls.uninhibit(cookie, self.sender)
+        if released:
+            log.info("inhibitor %d released", cookie)
+            self.controls_changed()
+        return released
+
+    def status(self):
+        monitor = self.monitor
+        status = {
+            "state": Variant("s", monitor.state.value),
+            "sensing": Variant("s", self.mode),
+            "quiet_seconds": Variant("d", monitor.quiet_seconds),
+            "speaker": Variant("s", monitor.sonar.found[0] or f"{monitor.sonar.speaker} (not found)"),
+            "microphone": Variant("s", monitor.sonar.found[1] or f"{monitor.sonar.microphone} (not found)"),
+            "camera": Variant("s", monitor.camera.device),
+            "version": Variant("s", __version__),
+        }
+        if self.idle_seconds is not None:
+            status["idle_seconds"] = Variant("d", self.idle_seconds)
+        if monitor.last_sonar is not None:
+            status["sonar_level_db"] = Variant("d", monitor.last_sonar.level_db)
+            status["sonar_motion_db"] = Variant("d", monitor.last_sonar.motion_db)
+            status["sonar_usable"] = Variant("b", monitor.last_sonar.usable)
+        if monitor.last_look is not None:
+            status["face_score"] = Variant("d", monitor.last_look.score)
+            status["camera_blind"] = Variant("b", monitor.last_look.blind)
+        return status
+
+    def on_message(self, message):
+        """See every incoming message before it is dispatched."""
+        if message.message_type == MessageType.METHOD_CALL and message.interface == INTERFACE:
+            # the service methods cannot see who called them; they read it from here
+            self.sender = message.sender
+        elif (
+            message.message_type == MessageType.SIGNAL
+            and message.member == "NameOwnerChanged"
+            and message.sender == "org.freedesktop.DBus"
+        ):
+            name, _, new_owner = message.body
+            if not new_owner and self.controls.release_owner(name):
+                log.info("inhibitors of %s released: it left the bus", name)
+                self.controls_changed()
+        return None
+
+    async def tick(self):
+        offset = self.boot_offset()
+        if offset - self.sleep_offset > SUSPEND_GAP:
+            log.info("resumed from suspend")
+            self.monitor.active()
+        self.sleep_offset = offset
+
+        if self.controls.paused != self.last_paused:
+            self.controls_changed()  # a timed pause ran out
+        if self.controls.paused or self.controls.inhibited:
+            self.set_mode("paused" if self.controls.paused else "inhibited")
+            self.monitor.active()
+            return
+
+        locked = await self.desktop.locked()
+        if locked and not self.config.wake.enabled:
+            self.set_mode("locked")
+            self.was_locked = True
+            return
+        if self.was_locked and not locked:
+            self.monitor.active()  # unlocking proves someone is here
+        self.was_locked = locked
+
+        self.idle_seconds = await self.desktop.idle_seconds()
+        if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
+            self.set_mode("input")
+            self.monitor.active()
+            return
+
+        self.set_mode("watching" if locked else "sensing")
+        before = self.monitor.state
+        await asyncio.to_thread(self.monitor.step)
+        seen = self.monitor.last_look
+        if locked and before is State.AWAY and self.monitor.state is State.PRESENT and seen and seen.faces:
+            log.info("someone came back: waking the screen")
+            await self.waker.wake()
+
+    async def run(self):
+        self.loop = asyncio.get_running_loop()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self.loop.add_signal_handler(signum, self.stop.set)
+
+        session = await MessageBus(bus_type=BusType.SESSION).connect()
+        system = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        self.desktop = Desktop(session, system)
+        self.interface = PresenceInterface(self)
+        session.add_message_handler(self.on_message)
+        session.export(OBJECT_PATH, self.interface)
+        await call(
+            session, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "AddMatch", "s", ("type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged'",),
+        )
+        reply = await session.request_name(BUS_NAME, NameFlag.DO_NOT_QUEUE)
+        if reply != RequestNameReply.PRIMARY_OWNER:
+            log.error("%s is already taken: is presenced running?", BUS_NAME)
+            return 1
+
+        log.info("presenced %s", __version__)
+        speaker, microphone = self.monitor.sonar.nodes()
+        log.info("speaker %s", speaker or f"{self.monitor.sonar.speaker!r} not found")
+        log.info("microphone %s", microphone or f"{self.monitor.sonar.microphone!r} not found")
+        log.info("camera %s", self.monitor.camera.device)
+        interval = self.config.sensing.interval
+        while not self.stop.is_set():
+            started = self.loop.time()
+            await self.tick()
+            self.poke.clear()
+            remaining = max(0.0, interval - (self.loop.time() - started))
+            waits = [asyncio.ensure_future(self.poke.wait()), asyncio.ensure_future(self.stop.wait())]
+            await asyncio.wait(waits, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            for waiting in waits:
+                waiting.cancel()
+        log.info("stopping")
+        session.disconnect()
+        system.disconnect()
+        return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="presenced", description=__doc__)
+    parser.add_argument("-c", "--config", help="configuration file (default ~/.config/presenced/config.toml)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log every reading")
+    parser.add_argument("--version", action="version", version=f"presenced {__version__}")
+    args = parser.parse_args()
+    under_journal = "JOURNAL_STREAM" in os.environ
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s" if under_journal else "%(asctime)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    try:
+        config = load(args.config)
+        daemon = Daemon(config)
+    except (ConfigError, LookupError, FileNotFoundError) as error:
+        log.error("%s", error)
+        return 2
+    return asyncio.run(daemon.run())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
