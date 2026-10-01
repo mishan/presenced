@@ -11,6 +11,8 @@ import math
 import time
 from dataclasses import dataclass
 
+MAX_PER_OWNER = 16
+
 
 @dataclass
 class Inhibitor:
@@ -27,8 +29,10 @@ class Controls:
         self.next_cookie = 1
 
     def pause(self, seconds):
-        """Pause for this many seconds, or until resumed if seconds is not positive."""
-        self.paused_until = math.inf if seconds <= 0 else self.clock() + seconds
+        """Pause for this many seconds, or until resumed if seconds is 0."""
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"pause length must be 0 or a positive number of seconds, not {seconds}")
+        self.paused_until = math.inf if seconds == 0 else self.clock() + seconds
 
     def resume(self):
         self.paused_until = None
@@ -40,6 +44,9 @@ class Controls:
         return self.paused_until is not None
 
     def inhibit(self, owner, who, why):
+        held = sum(1 for inhibitor in self.inhibitors.values() if inhibitor.owner == owner)
+        if held >= MAX_PER_OWNER:
+            raise ValueError(f"{owner} already holds {held} inhibitors")
         cookie = self.next_cookie
         self.next_cookie += 1
         self.inhibitors[cookie] = Inhibitor(owner, who, why)

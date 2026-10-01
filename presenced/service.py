@@ -4,12 +4,14 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 
 from dbus_fast import BusType, MessageType, Variant
 from dbus_fast.aio import MessageBus
-from dbus_fast.constants import NameFlag, PropertyAccess, RequestNameReply
+from dbus_fast.constants import ErrorType, NameFlag, PropertyAccess, RequestNameReply
+from dbus_fast.errors import DBusError
 from dbus_fast.service import ServiceInterface, dbus_property, method
 from dbus_fast.service import signal as dbus_signal
 
@@ -29,6 +31,7 @@ OBJECT_PATH = "/io/github/mishan/Presenced"
 INTERFACE = "io.github.mishan.Presenced1"
 
 SUSPEND_GAP = 5.0  # seconds of boot time the monotonic clock missed: we were asleep
+CAMERA_RELEASE_S = 1.0  # how long a pause or inhibit waits for a look under way to give up the camera
 
 
 class PresenceInterface(ServiceInterface):
@@ -65,7 +68,10 @@ class PresenceInterface(ServiceInterface):
 
     @method()
     def Pause(self, seconds: "d"):
-        self.daemon.pause(seconds)
+        try:
+            self.daemon.pause(seconds)
+        except ValueError as error:
+            raise DBusError(ErrorType.INVALID_ARGS, str(error)) from None
 
     @method()
     def Resume(self):
@@ -73,7 +79,10 @@ class PresenceInterface(ServiceInterface):
 
     @method()
     def Inhibit(self, who: "s", why: "s") -> "u":
-        return self.daemon.inhibit(who, why)
+        try:
+            return self.daemon.inhibit(who, why)
+        except ValueError as error:
+            raise DBusError(ErrorType.LIMITS_EXCEEDED, str(error)) from None
 
     @method()
     def Uninhibit(self, cookie: "u") -> "b":
@@ -99,12 +108,13 @@ class Daemon:
         self.sender = None  # unique name of the caller of the method being handled
         self.poke = asyncio.Event()
         self.stop = asyncio.Event()
+        self.actions = asyncio.Queue()
         self.last_paused = False
-        sonar, camera = config.sonar, config.camera
+        self.last_error = None
         self.monitor = monitor or Monitor(
-            Sonar(sonar.tone_hz, sonar.burst, sonar.speaker, sonar.microphone) if sonar.enabled else NoSonar(),
-            IRCamera(camera.device, camera.score_threshold, camera.min_face_width) if camera.enabled else NoCamera(),
-            sonar.threshold_db,
+            make_sonar(config.sonar),
+            make_camera(config.camera),
+            config.sonar.threshold_db,
             config.sensing.quiet_for,
             config.sensing.recheck_after,
         )
@@ -126,7 +136,16 @@ class Daemon:
         self.interface.emit_properties_changed({"State": state.value, "StateSince": self.state_since})
         command = self.config.actions.on_away if state is State.AWAY else self.config.actions.on_present
         if command:
-            asyncio.ensure_future(self.run_action(command, state))
+            self.actions.put_nowait((command, state))
+
+    async def run_actions(self):
+        """Run actions one at a time, in order, so a quick away and back cannot cross over."""
+        while True:
+            command, state = await self.actions.get()
+            try:
+                await self.run_action(command, state)
+            except Exception:
+                log.exception("%s action failed: %s", state.value, command)
 
     async def run_action(self, command, state):
         # presenced itself runs outside the desktop session (under systemd, or
@@ -156,9 +175,30 @@ class Daemon:
         )
         self.poke.set()
 
+    def hold_now(self):
+        """Freeze the state at once and get the camera back, even mid-look."""
+        self.monitor.hold.set()
+        camera = self.monitor.camera
+        camera.abort.set()
+        if not camera.idle.wait(CAMERA_RELEASE_S):
+            log.warning("the camera was still busy after %g s", CAMERA_RELEASE_S)
+
+    def hold(self, mode):
+        self.set_mode(mode)
+        if not self.monitor.hold.is_set():
+            self.monitor.hold.set()
+            self.monitor.camera.abort.set()
+
+    def release(self):
+        if self.monitor.hold.is_set():
+            self.monitor.hold.clear()
+            self.monitor.camera.abort.clear()
+            self.monitor.restart()  # whatever was counted before the hold is stale now
+
     def pause(self, seconds):
         self.controls.pause(seconds)
         log.info("paused %s", f"for {seconds:g} s" if seconds > 0 else "until resumed")
+        self.hold_now()
         self.controls_changed()
 
     def resume(self):
@@ -169,6 +209,7 @@ class Daemon:
     def inhibit(self, who, why):
         cookie = self.controls.inhibit(self.sender, who, why)
         log.info("inhibited by %s (%s): %s", who, self.sender, why)
+        self.hold_now()
         self.controls_changed()
         return cookie
 
@@ -203,8 +244,9 @@ class Daemon:
 
     def on_message(self, message):
         """See every incoming message before it is dispatched."""
-        if message.message_type == MessageType.METHOD_CALL and message.interface == INTERFACE:
-            # the service methods cannot see who called them; they read it from here
+        if message.message_type == MessageType.METHOD_CALL and message.path == OBJECT_PATH:
+            # the service methods cannot see who called them; they read it from here.
+            # Match on the path alone: a call may leave out the interface name
             self.sender = message.sender
         elif (
             message.message_type == MessageType.SIGNAL
@@ -221,30 +263,30 @@ class Daemon:
         offset = self.boot_offset()
         if offset - self.sleep_offset > SUSPEND_GAP:
             log.info("resumed from suspend")
-            self.monitor.active()
+            self.monitor.restart()
         self.sleep_offset = offset
 
         if self.controls.paused != self.last_paused:
             self.controls_changed()  # a timed pause ran out
         if self.controls.paused or self.controls.inhibited:
-            self.set_mode("paused" if self.controls.paused else "inhibited")
-            self.monitor.active()
+            self.hold("paused" if self.controls.paused else "inhibited")
             return
 
         locked = await self.desktop.locked()
-        if locked and not self.config.wake.enabled:
-            self.set_mode("locked")
-            self.was_locked = True
-            return
-        if self.was_locked and not locked:
-            self.monitor.active()  # unlocking proves someone is here
+        unlocked = self.was_locked and not locked
         self.was_locked = locked
+        if locked and not self.config.wake.enabled:
+            self.hold("locked")
+            return
 
         if not locked and self.config.sensing.respect_idle_inhibitors and await self.desktop.idle_inhibited():
             # a video is playing, say: the desktop will not blank or lock, and neither should we
-            self.set_mode("held")
-            self.monitor.active()
+            self.hold("held")
             return
+
+        self.release()
+        if unlocked:
+            self.monitor.active()  # only a person can unlock the screen
 
         self.idle_seconds = await self.desktop.idle_seconds()
         if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
@@ -259,6 +301,20 @@ class Daemon:
         if locked and before is State.AWAY and self.monitor.state is State.PRESENT and seen and seen.faces:
             log.info("someone came back: waking the screen")
             await self.waker.wake()
+
+    async def safe_tick(self):
+        """A tick that logs what went wrong instead of ending the daemon."""
+        try:
+            await self.tick()
+        except Exception as error:
+            summary = f"{type(error).__name__}: {error}"
+            if summary != self.last_error:
+                log.exception("sensing failed; carrying on")
+                self.last_error = summary
+            else:
+                log.debug("sensing failed again: %s", summary)
+        else:
+            self.last_error = None
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
@@ -285,20 +341,39 @@ class Daemon:
         log.info("speaker %s", speaker or f"{self.monitor.sonar.speaker!r} not found")
         log.info("microphone %s", microphone or f"{self.monitor.sonar.microphone!r} not found")
         log.info("camera %s", self.monitor.camera.device)
+        actions = asyncio.ensure_future(self.run_actions())
         interval = self.config.sensing.interval
         while not self.stop.is_set():
             started = self.loop.time()
-            await self.tick()
-            self.poke.clear()
+            self.poke.clear()  # before the tick, so a poke during it is not lost
+            await self.safe_tick()
             remaining = max(0.0, interval - (self.loop.time() - started))
             waits = [asyncio.ensure_future(self.poke.wait()), asyncio.ensure_future(self.stop.wait())]
             await asyncio.wait(waits, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             for waiting in waits:
                 waiting.cancel()
         log.info("stopping")
+        actions.cancel()
         session.disconnect()
         system.disconnect()
         return 0
+
+
+def make_sonar(config):
+    if not config.enabled:
+        return NoSonar()
+    return Sonar(config.tone_hz, config.burst, config.speaker, config.microphone)
+
+
+def make_camera(config):
+    """The IR camera, or a stand-in if it is turned off or cannot be used."""
+    if not config.enabled:
+        return NoCamera()
+    try:
+        return IRCamera(config.device, config.score_threshold, config.min_face_width)
+    except (LookupError, FileNotFoundError, OSError, subprocess.SubprocessError) as error:
+        log.warning("no camera, sensing with the sonar alone: %s", error)
+        return NoCamera()
 
 
 def main():

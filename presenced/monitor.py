@@ -8,6 +8,7 @@ user counts as away.
 """
 import enum
 import logging
+import threading
 import time
 
 log = logging.getLogger("presenced")
@@ -45,13 +46,16 @@ class Monitor:
         self.blind_at = None  # when the camera last saw nothing at all
         self.last_sonar = None
         self.last_look = None
+        # while set, the state is frozen: a step already under way when sensing
+        # was paused or inhibited must not switch it, or run an action
+        self.hold = threading.Event()
 
     @property
     def quiet_seconds(self):
         return 0.0 if self.quiet_since is None else self.clock() - self.quiet_since
 
     def switch(self, state):
-        if state is self.state:
+        if state is self.state or self.hold.is_set():
             return
         self.state = state
         self.quiet_since = None if state is State.PRESENT else self.clock()
@@ -64,9 +68,15 @@ class Monitor:
 
     def active(self):
         """Something other than the sensors showed the user is here: input, an unlock."""
-        self.quiet_since = None
-        self.missed_at = None
+        self.restart()
         self.switch(State.PRESENT)
+
+    def restart(self):
+        """Forget the current quiet run, as after a pause or a suspend: start counting afresh."""
+        self.quiet_since = None if self.state is State.PRESENT else self.clock()
+        self.missed_at = None
+        self.looked_at = None
+        self.blind_at = None
 
     def look(self):
         seen = self.camera.look()
@@ -78,6 +88,8 @@ class Monitor:
         return seen
 
     def step(self):
+        if self.hold.is_set():
+            return
         now = self.clock()
         reading = self.sonar.probe()
         self.last_sonar = reading

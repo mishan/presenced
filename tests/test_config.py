@@ -32,3 +32,19 @@ def test_rendered_template_reads_back_the_same():
     config.sonar.tone_hz = 21500.0
     config.actions.on_away = 'notify-send "gone" && loginctl lock-session'
     assert parse(render(config)) == config
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[sonar]\nburst = 0\n",
+        "[sonar]\ntone_hz = 30000\n",
+        "[sensing]\ninterval = 0\n",
+        "[sensing]\nquiet_for = -5\n",
+        "[camera]\nmin_face_width = 2\n",
+        "[camera]\nscore_threshold = -0.1\n",
+    ],
+)
+def test_out_of_range_values_are_errors(text):
+    with pytest.raises(ConfigError, match="must be"):
+        parse(text)

@@ -25,6 +25,8 @@ LEAD_S = 0.3  # recorder head start, and tail after the tone ends
 TONE_GAIN = 0.5
 MIN_LEVEL_DB = -50.0  # below this the speaker is muted or turned right down
 MIN_BLOCKS = 10
+PLAY_SLACK_S = 5.0  # pw-play gets this long beyond the tone itself before it is killed
+STOP_TIMEOUT_S = 2.0  # and pw-record this long to stop when asked
 STREAM = ["--raw", "--rate", str(RATE), "--channels", str(CHANNELS), "--format", "s16"]
 
 # If the speaker goes away, PipeWire would otherwise send the tone to whatever
@@ -45,22 +47,66 @@ class SonarReading:
 UNUSABLE = SonarReading(-120.0, 0.0)
 
 
-def find_node(media_class, hint):
-    """Name of the PipeWire node of a class that is, or matches, hint; None if absent."""
-    dump = subprocess.run(["pw-dump"], capture_output=True, check=True).stdout
-    candidates = []
-    for obj in json.loads(dump):
-        props = obj.get("info", {}).get("props", {})
-        if props.get("media.class") == media_class and "node.name" in props:
-            candidates.append(props)
-    for props in candidates:
-        if props["node.name"] == hint:
-            return hint
-    for props in candidates:
-        text = f"{props['node.name']} {props.get('node.description', '')}"
-        if hint.lower() in text.lower():
-            return props["node.name"]
-    return None
+def pipewire_objects():
+    """Everything PipeWire knows about, or an empty list if it cannot be asked."""
+    try:
+        dump = subprocess.run(["pw-dump"], capture_output=True, check=True, timeout=10).stdout
+        return json.loads(dump)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        log.debug("pw-dump failed: %s", error)
+        return []
+
+
+def matches(props, hint):
+    text = f"{props['node.name']} {props.get('node.description', '')}"
+    return props["node.name"] == hint or hint.lower() in text.lower()
+
+
+def active_routes(objects):
+    """{(device id, profile device index): active route name} for every audio device."""
+    routes = {}
+    for obj in objects:
+        info = obj.get("info") or {}
+        for route in (info.get("params") or {}).get("Route", []):
+            for index in route.get("devices", []):
+                routes[(obj.get("id"), route.get("direction"), index)] = (
+                    f"{route.get('name', '')} {route.get('description', '')}"
+                )
+    return routes
+
+
+def is_laptop_speaker(props, routes):
+    """Whether a sink is a built-in speaker, and not headphones, HDMI or Bluetooth.
+
+    PipeWire reports the output route each sink currently plays through; where
+    it does not, fall back to the sink's own name.
+    """
+    if props.get("device.api") != "alsa":
+        return False
+    route = routes.get((props.get("device.id"), "Output", props.get("card.profile.device")))
+    text = route if route is not None else f"{props['node.name']} {props.get('node.description', '')}"
+    text = text.lower()
+    return "speaker" in text and not any(word in text for word in ("headphone", "headset", "hdmi", "line"))
+
+
+def find_node(media_class, hint, objects=None):
+    """Name of the PipeWire node of a class that is, or matches, hint; None if absent.
+
+    Speakers must also be the laptop's own: the tone is never sent anywhere
+    else, whatever the hint says.
+    """
+    objects = pipewire_objects() if objects is None else objects
+    candidates = [
+        props
+        for props in ((obj.get("info") or {}).get("props") or {} for obj in objects)
+        if props.get("media.class") == media_class and "node.name" in props
+    ]
+    if media_class == "Audio/Sink":
+        routes = active_routes(objects)
+        candidates = [props for props in candidates if is_laptop_speaker(props, routes)]
+    exact = [props for props in candidates if props["node.name"] == hint]
+    matching = exact or [props for props in candidates if matches(props, hint)]
+    return matching[0]["node.name"] if matching else None
 
 
 def to_pcm(mono):
@@ -104,6 +150,8 @@ def analyze(samples, tone_hz):
     # where the maximum would instead follow a key click or a knock on the case
     magnitude = np.abs(base).mean(axis=1)
     on = np.flatnonzero(magnitude > 0.5 * np.percentile(magnitude, 75))
+    if len(on) == 0:  # pure silence: a muted microphone delivers exact zeros
+        return UNUSABLE
     trim = int(round(FADE_S / BLOCK_S)) + 1
     steady = base[on[0] + trim : on[-1] + 1 - trim]
     if len(steady) < MIN_BLOCKS:
@@ -124,7 +172,11 @@ class Sonar:
 
     def nodes(self):
         """Current speaker and microphone node names; either is None if missing."""
-        self.found = find_node("Audio/Sink", self.speaker), find_node("Audio/Source", self.microphone)
+        objects = pipewire_objects()
+        self.found = (
+            find_node("Audio/Sink", self.speaker, objects),
+            find_node("Audio/Source", self.microphone, objects),
+        )
         return self.found
 
     def play(self, pcm, sink=None):
@@ -132,11 +184,17 @@ class Sonar:
         sink = sink or self.nodes()[0]
         if sink is None:
             return False
-        result = subprocess.run(
-            ["pw-play", *STREAM, "--target", sink, "-P", PLAYBACK_PROPERTIES, "-"],
-            input=pcm,
-            stderr=subprocess.DEVNULL,
-        )
+        seconds = len(pcm) / (RATE * CHANNELS * 2)
+        try:
+            result = subprocess.run(
+                ["pw-play", *STREAM, "--target", sink, "-P", PLAYBACK_PROPERTIES, "-"],
+                input=pcm,
+                stderr=subprocess.DEVNULL,
+                timeout=seconds + PLAY_SLACK_S,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log.debug("pw-play failed: %s", error)
+            return False
         return result.returncode == 0
 
     def probe(self):
@@ -158,7 +216,11 @@ class Sonar:
                 time.sleep(LEAD_S)
             finally:
                 recorder.send_signal(signal.SIGINT)
-                recorder.wait()
+                try:
+                    recorder.wait(timeout=STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    recorder.kill()
+                    recorder.wait()
             if not played:
                 return UNUSABLE
             recording.seek(0)

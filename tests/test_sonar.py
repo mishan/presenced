@@ -53,3 +53,78 @@ def test_a_click_does_not_hide_the_burst():
     samples[RATE : RATE + 40] += 0.9
     reading = analyze(samples, TONE_HZ)
     assert reading.usable
+
+
+def test_a_muted_microphone_is_unusable_not_a_crash():
+    assert not analyze(np.zeros((RATE * 2, CHANNELS)), TONE_HZ).usable
+
+
+def test_empty_and_tiny_recordings_are_unusable():
+    assert not analyze(np.zeros((0, CHANNELS)), TONE_HZ).usable
+    assert not analyze(np.zeros((100, CHANNELS)), TONE_HZ).usable
+
+
+def test_the_shortest_allowed_burst_still_measures():
+    reading = analyze(recording(echo_gain=0.0, seconds=1.0 + 2 * 0.3), TONE_HZ)
+    assert reading.usable
+
+
+def sink(node_id, name, description, api="alsa", device_id=67, index=0):
+    return {
+        "id": node_id,
+        "type": "PipeWire:Interface:Node",
+        "info": {"props": {
+            "media.class": "Audio/Sink", "node.name": name, "node.description": description,
+            "device.api": api, "device.id": device_id, "card.profile.device": index,
+        }},
+    }
+
+
+def card(device_id, routes):
+    return {
+        "id": device_id,
+        "type": "PipeWire:Interface:Device",
+        "info": {"props": {"media.class": "Audio/Device"}, "params": {"Route": [
+            {"direction": "Output", "name": name, "description": name, "devices": [index]}
+            for index, name in routes
+        ]}},
+    }
+
+
+def test_only_the_laptop_speaker_is_used():
+    from presenced.sonar import find_node
+
+    objects = [
+        sink(80, "bluez_output.JBL", "JBL Flip Speaker", api="bluez5"),
+        sink(71, "alsa_output.HiFi__HDMI1__sink", "HDMI / DisplayPort 1 Output", index=0),
+        sink(74, "alsa_output.HiFi__Speaker__sink", "Speaker", index=3),
+        card(67, [(3, "[Out] Speaker")]),
+    ]
+    assert find_node("Audio/Sink", "speaker", objects) == "alsa_output.HiFi__Speaker__sink"
+    # naming another sink outright does not get around it
+    assert find_node("Audio/Sink", "bluez_output.JBL", objects) is None
+
+
+def test_a_shared_output_playing_through_headphones_is_refused():
+    from presenced.sonar import find_node
+
+    objects = [
+        sink(74, "alsa_output.analog-stereo", "Built-in Audio Analog Stereo Speaker", index=0),
+        card(67, [(0, "analog-output-headphones")]),
+    ]
+    assert find_node("Audio/Sink", "speaker", objects) is None
+    objects[1] = card(67, [(0, "analog-output-speaker")])
+    assert find_node("Audio/Sink", "speaker", objects) == "alsa_output.analog-stereo"
+
+
+def test_pipewire_trouble_means_no_nodes_rather_than_a_crash(monkeypatch):
+    import subprocess
+
+    from presenced import sonar
+
+    def broken(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "pw-dump")
+
+    monkeypatch.setattr(sonar.subprocess, "run", broken)
+    assert sonar.Sonar().nodes() == (None, None)
+    assert not sonar.Sonar().probe().usable

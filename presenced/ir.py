@@ -13,8 +13,12 @@ exposure it settles on carries over to the next stream.
 """
 import glob
 import hashlib
+import os
 import re
+import select
 import subprocess
+import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 
@@ -40,6 +44,7 @@ ROI_GROW = 1.5  # meter on a little more than the face box
 MIN_STROBE = 3.0  # lit minus unlit brightness below this means the camera is blind
 NEAR = 40
 DETECT_FLOOR = 0.3  # report scores down to here, so thresholds can be tuned from logs
+STREAM_TIMEOUT_S = 6.0  # a camera that stalls mid-stream must not stall the daemon
 
 
 @dataclass
@@ -50,18 +55,46 @@ class IRReading:
     blind: bool  # no strobe seen: shutter closed, or the emitter is off
 
 
-def find_camera():
-    """Device path and frame size of the first camera that offers greyscale."""
-    for device in sorted(glob.glob("/dev/video*")):
-        listing = subprocess.run(
-            ["v4l2-ctl", "-d", device, "--list-formats-ext"], capture_output=True, text=True
-        ).stdout
-        if "'GREY'" not in listing:
-            continue
-        size = re.search(r"Size: Discrete (\d+)x(\d+)", listing)
+def greyscale_size(device):
+    """Frame size of a device's greyscale (IR) format, or None if it has none."""
+    listing = subprocess.run(
+        ["v4l2-ctl", "-d", device, "--list-formats-ext"], capture_output=True, text=True, timeout=10
+    ).stdout
+    start = listing.find("'GREY'")
+    if start < 0:
+        return None
+    size = re.search(r"Size: Discrete (\d+)x(\d+)", listing[start:])
+    return (int(size[1]), int(size[2])) if size else None
+
+
+def find_camera(device=""):
+    """Device path and frame size of the given camera, or of the first IR one."""
+    if device:
+        size = greyscale_size(device)
+        if size is None:
+            raise LookupError(f"{device} has no greyscale (IR) format")
+        return device, *size
+    for candidate in sorted(glob.glob("/dev/video*")):
+        size = greyscale_size(candidate)
         if size:
-            return device, int(size[1]), int(size[2])
+            return candidate, *size
     raise LookupError("no greyscale (IR) camera found")
+
+
+def read_exactly(stream, size, deadline):
+    """size bytes from a pipe, or fewer if it ends or the deadline passes."""
+    fd = stream.fileno()
+    chunks, have = [], 0
+    while have < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            break
+        chunk = os.read(fd, size - have)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        have += len(chunk)
+    return b"".join(chunks)
 
 
 def model_path():
@@ -91,9 +124,10 @@ def roi_control(x, y, w, h):
 
 class IRCamera:
     def __init__(self, device="", score_threshold=0.5, min_face_width=0.08):
-        found = find_camera()
-        self.device = device or found[0]
-        self.width, self.height = found[1], found[2]
+        self.device, self.width, self.height = find_camera(device)
+        self.abort = threading.Event()  # set to cut a look short and free the camera
+        self.idle = threading.Event()  # set while the camera is not streaming
+        self.idle.set()
         self.score_threshold = score_threshold
         self.min_face_px = min_face_width * self.width
         model = model_path()
@@ -104,7 +138,7 @@ class IRCamera:
         )
         self.roi = self.default_roi()
         self.metering = subprocess.run(
-            ["v4l2-ctl", "-d", self.device, "--list-ctrls"], capture_output=True, text=True
+            ["v4l2-ctl", "-d", self.device, "--list-ctrls"], capture_output=True, text=True, timeout=10
         ).stdout.count("region_of_interest_rectangle") > 0
 
     def default_roi(self):
@@ -123,34 +157,43 @@ class IRCamera:
         MAX_FRAMES, until the exposure has caught up.
         """
         size = self.width * self.height
-        stream = subprocess.Popen(
-            [
-                "v4l2-ctl", "-d", self.device,
-                f"--set-fmt-video=width={self.width},height={self.height},pixelformat=GREY",
-                "--stream-mmap", f"--stream-count={MAX_FRAMES}", "--stream-to=-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
         frames = []
+        self.idle.clear()
         try:
-            for n in range(MAX_FRAMES):
-                buf = stream.stdout.read(size)
-                if len(buf) < size:
-                    break
-                frames.append(np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width))
-                if n == 0 and self.metering:
-                    subprocess.run(
-                        ["v4l2-ctl", "-d", self.device, "--set-ctrl", roi_control(*self.roi)],
-                        capture_output=True,
-                    )
-                if n + 1 >= GRAB_FRAMES:
-                    brighter = max(frames[-2:], key=lambda frame: frame.mean())
-                    if self.clipped(brighter) < CLIPPED:
+            stream = subprocess.Popen(
+                [
+                    "v4l2-ctl", "-d", self.device,
+                    f"--set-fmt-video=width={self.width},height={self.height},pixelformat=GREY",
+                    "--stream-mmap", f"--stream-count={MAX_FRAMES}", "--stream-to=-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + STREAM_TIMEOUT_S
+                for n in range(MAX_FRAMES):
+                    if self.abort.is_set():
+                        frames = []
                         break
+                    buf = read_exactly(stream.stdout, size, deadline)
+                    if len(buf) < size:
+                        break
+                    frames.append(np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width))
+                    if n == 0 and self.metering:
+                        subprocess.run(
+                            ["v4l2-ctl", "-d", self.device, "--set-ctrl", roi_control(*self.roi)],
+                            capture_output=True,
+                            timeout=5,
+                        )
+                    if n + 1 >= GRAB_FRAMES:
+                        brighter = max(frames[-2:], key=lambda frame: frame.mean())
+                        if self.clipped(brighter) < CLIPPED:
+                            break
+            finally:
+                stream.kill()
+                stream.wait()
         finally:
-            stream.terminate()
-            stream.wait()
+            self.idle.set()
         return np.stack(frames) if frames else np.zeros((0, self.height, self.width), np.uint8)
 
     def meter_on(self, box):
@@ -200,9 +243,14 @@ class IRCamera:
 
 
 class NoCamera:
-    """Stands in when the camera is turned off: always blind."""
+    """Stands in when the camera is turned off or missing: always blind."""
 
     device = "disabled"
+
+    def __init__(self):
+        self.abort = threading.Event()
+        self.idle = threading.Event()
+        self.idle.set()
 
     def look(self):
         return IRReading(0, 0.0, 0.0, True)

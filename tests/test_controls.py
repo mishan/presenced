@@ -50,3 +50,26 @@ def test_inhibitors_go_when_their_program_leaves_the_bus():
     kept = controls.inhibit(":1.7", "obs", "recording")
     assert controls.release_owner(":1.5") == 2
     assert list(controls.inhibitors) == [kept]
+
+
+def test_pause_lengths_must_be_real():
+    import pytest
+
+    controls = Controls(Clock())
+    for seconds in (math.nan, math.inf, -1.0):
+        with pytest.raises(ValueError):
+            controls.pause(seconds)
+    assert not controls.paused
+
+
+def test_one_program_cannot_pile_up_inhibitors():
+    import pytest
+
+    from presenced.controls import MAX_PER_OWNER
+
+    controls = Controls(Clock())
+    for _ in range(MAX_PER_OWNER):
+        controls.inhibit(":1.5", "x", "y")
+    with pytest.raises(ValueError):
+        controls.inhibit(":1.5", "x", "y")
+    controls.inhibit(":1.6", "x", "y")  # others are unaffected

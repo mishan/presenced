@@ -40,7 +40,8 @@ def update_config(text, tone_hz, threshold_db):
     """Config text with the [sonar] tone and threshold set, everything else kept."""
     values = {"tone_hz": f"{tone_hz:g}", "threshold_db": f"{threshold_db:g}"}
     lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if line.strip() == "[sonar]"), None)
+    header = re.compile(r"\s*\[\s*sonar\s*\]\s*(#.*)?$")
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
     if start is None:
         lines += ["", "[sonar]"] + [f"{key} = {value}" for key, value in values.items()]
         return "\n".join(lines) + "\n"

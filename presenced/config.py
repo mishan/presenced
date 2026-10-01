@@ -69,6 +69,20 @@ class ConfigError(ValueError):
     pass
 
 
+# (lowest, highest) allowed for each number; None leaves that side open
+LIMITS = {
+    "sensing.start_after_idle": (0.0, None),
+    "sensing.quiet_for": (1.0, None),
+    "sensing.recheck_after": (0.0, None),
+    "sensing.interval": (0.5, 60.0),
+    "sonar.tone_hz": (15000.0, 23500.0),  # below is audible to most people, above aliases at 48 kHz
+    "sonar.burst": (1.0, 10.0),  # shorter leaves too little steady tone to measure
+    "sonar.threshold_db": (-80.0, 0.0),
+    "camera.score_threshold": (0.0, 1.0),
+    "camera.min_face_width": (0.0, 1.0),
+}
+
+
 def parse(text, source="config"):
     try:
         raw = tomllib.loads(text)
@@ -91,6 +105,12 @@ def parse(text, source="config"):
                 value = float(value)
             if not isinstance(value, expected):
                 raise ConfigError(f"{source}: {name}.{key} must be {expected.__name__}")
+            low, high = LIMITS.get(f"{name}.{key}", (None, None))
+            if (low is not None and value < low) or (high is not None and value > high):
+                span = f"between {low:g} and {high:g}" if low is not None and high is not None else (
+                    f"at least {low:g}" if low is not None else f"at most {high:g}"
+                )
+                raise ConfigError(f"{source}: {name}.{key} must be {span}, not {value:g}")
             setattr(section, key, value)
     return config
 

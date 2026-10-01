@@ -34,7 +34,14 @@ apart (default 10). Any motion or input in between starts the count again. With
 the defaults, walking away is noticed after about 45 seconds.
 
 You count as back as soon as there is input, the screen is unlocked, or the
-sonar sees motion and the camera sees a face.
+sonar sees motion and the camera sees a face. With the camera blind (the
+privacy shutter closed, say), the sonar decides alone: you count as away after
+three quiet periods (90 seconds by default) and back on the first motion.
+
+While sensing is paused or inhibited, while a video is playing, and while the
+screen is locked (unless waking is on), the state is frozen as it was and no
+actions run. Unlocking the screen counts as present, since only a person can
+do that. After a suspend, sensing simply starts counting again.
 
 ## Requirements
 
@@ -150,7 +157,7 @@ crashes cannot leave sensing off.
 
 Audio and camera frames are analyzed in memory and never stored or sent
 anywhere. The microphones record only while a tone plays, and the camera runs
-for under a second per look. The camera LED lights for each look.
+for under two seconds per look. The camera LED lights for each look.
 
 ## Limits
 
@@ -163,8 +170,11 @@ for under a second per look. The camera LED lights for each look.
   helps. `tone_hz` can be set by hand.
 - **The tone follows the speaker volume.** When the speaker is muted or
   headphones are plugged in, the sonar cannot hear anything and presenced
-  relies on the camera alone. The tone is only ever sent to the laptop
-  speaker, never to headphones or other outputs.
+  relies on the camera alone. The tone is only ever sent to the laptop's own
+  speaker: a sink counts only if PipeWire reports it as a built-in (ALSA)
+  output currently playing through a speaker, never headphones, HDMI or
+  Bluetooth, whatever the `speaker` setting matches.
+- **No IR camera?** presenced runs on the sonar alone, and says so in its log.
 - **Sitting very still for a long time** means the camera looks now and then
   (once per `quiet_for`) to make sure you are still there.
 - **Only faces count,** and only faces close enough to be at the laptop.

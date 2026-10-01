@@ -218,7 +218,7 @@ async def cmd_camera(args):
     from .ir import IRCamera
 
     config = load(args.config).camera
-    camera = IRCamera(config.device, config.score_threshold)
+    camera = IRCamera(config.device, config.score_threshold, config.min_face_width)
     print(f"camera {camera.device}")
     async with inhibited("camera readings"):
         print("faces score near_pct blind")

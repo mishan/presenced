@@ -186,3 +186,27 @@ def test_blind_camera_is_not_asked_every_probe():
     fake.seen = BLIND
     run_for(fake, mon, 300)
     assert fake.looks <= 300 / 30 + 1
+
+
+def test_a_held_monitor_neither_steps_nor_switches():
+    fake, mon = monitor()
+    fake.reading = QUIET
+    fake.seen = EMPTY
+    mon.hold.set()
+    run_for(fake, mon, 120)
+    assert mon.state is State.PRESENT
+    assert fake.looks == 0
+    mon.switch(State.AWAY)  # even a step already under way cannot switch it
+    assert mon.state is State.PRESENT
+
+
+def test_restart_forgets_the_quiet_run_but_keeps_the_state():
+    fake, mon = monitor()
+    fake.reading = QUIET
+    fake.seen = EMPTY
+    run_for(fake, mon, 33)
+    assert fake.looks == 1
+    mon.restart()
+    assert mon.state is State.PRESENT
+    run_for(fake, mon, 27)
+    assert fake.looks == 1  # a full new quiet period is needed before the next look

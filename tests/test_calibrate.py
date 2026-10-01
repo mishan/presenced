@@ -41,3 +41,11 @@ def test_new_file_is_a_full_template():
     config = parse(config_text(None, 21000.0, -29.0))
     assert config.sonar.tone_hz == 21000.0
     assert config.sonar.threshold_db == -29.0
+
+
+def test_a_commented_section_header_is_found():
+    updated = update_config("[sonar]  # tuned by hand\nburst = 2\n", 21000.0, -29.0)
+    assert updated.count("[sonar]") == 1
+    config = parse(updated)
+    assert config.sonar.tone_hz == 21000.0
+    assert config.sonar.burst == 2.0
