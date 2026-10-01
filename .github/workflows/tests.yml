@@ -15,8 +15,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-          # keeps the wheels pip has to build itself (there are no prebuilt
-          # ones for the newest Python yet), so only the first run builds them
+          # downloads from PyPI are sometimes very slow on the runners (minutes
+          # for opencv alone), so keep them between runs
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e '.[dev]'
