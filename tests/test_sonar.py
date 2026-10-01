@@ -69,13 +69,13 @@ def test_the_shortest_allowed_burst_still_measures():
     assert reading.usable
 
 
-def sink(node_id, name, description, api="alsa", device_id=67, index=0):
+def sink(node_id, name, description, api="alsa", device_id=67, index=0, bus="pci"):
     return {
         "id": node_id,
         "type": "PipeWire:Interface:Node",
         "info": {"props": {
             "media.class": "Audio/Sink", "node.name": name, "node.description": description,
-            "device.api": api, "device.id": device_id, "card.profile.device": index,
+            "device.api": api, "device.id": device_id, "card.profile.device": index, "device.bus": bus,
         }},
     }
 
@@ -85,7 +85,7 @@ def card(device_id, routes):
         "id": device_id,
         "type": "PipeWire:Interface:Device",
         "info": {"props": {"media.class": "Audio/Device"}, "params": {"Route": [
-            {"direction": "Output", "name": name, "description": name, "devices": [index]}
+            {"direction": "Output", "name": name, "description": name, "device": index, "devices": [index]}
             for index, name in routes
         ]}},
     }
@@ -128,3 +128,41 @@ def test_pipewire_trouble_means_no_nodes_rather_than_a_crash(monkeypatch):
     monkeypatch.setattr(sonar.subprocess, "run", broken)
     assert sonar.Sonar().nodes() == (None, None)
     assert not sonar.Sonar().probe().usable
+
+
+def test_a_usb_headset_that_calls_itself_a_speaker_is_refused():
+    from presenced.sonar import find_node
+
+    objects = [
+        sink(90, "alsa_output.usb-C-Media_USB_Headset-00.analog-stereo", "USB Speaker Headset Analog Stereo",
+             device_id=88, bus="usb"),
+        card(88, [(0, "analog-output-speaker")]),
+    ]
+    assert find_node("Audio/Sink", "speaker", objects) is None
+
+
+def test_a_headset_named_in_the_description_is_refused_even_on_a_speaker_route():
+    from presenced.sonar import find_node
+
+    objects = [
+        sink(74, "alsa_output.pci.analog-stereo", "Headset Speaker", index=0),
+        card(67, [(0, "analog-output-speaker")]),
+    ]
+    assert find_node("Audio/Sink", "speaker", objects) is None
+
+
+def test_the_route_a_sink_actually_plays_on_decides():
+    from presenced.sonar import find_node
+
+    # two active routes; the stale "devices" lists overlap, the "device" fields do not
+    objects = [
+        sink(74, "alsa_output.HiFi__Headphones__sink", "Headphones", index=1),
+        {
+            "id": 67, "type": "PipeWire:Interface:Device",
+            "info": {"props": {}, "params": {"Route": [
+                {"direction": "Output", "name": "[Out] Headphones", "device": 1, "devices": [1]},
+                {"direction": "Output", "name": "[Out] Speaker", "device": 3, "devices": [1, 3]},
+            ]}},
+        },
+    ]
+    assert find_node("Audio/Sink", "", objects) is None

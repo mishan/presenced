@@ -1,5 +1,6 @@
 """What the desktop knows: time since the last input, whether the screen is locked,
 and whether a program has asked it not to go idle."""
+import asyncio
 import logging
 import os
 
@@ -16,21 +17,29 @@ IDLE_SOURCES = [
 ]
 
 LOGIND = "org.freedesktop.login1"
+CALL_TIMEOUT_S = 5.0
 
 GNOME_INHIBIT_IDLE = 8  # the "don't go idle" flag of GNOME's session manager inhibitors
 
 
 async def call(bus, destination, path, interface, member, signature="", body=()):
-    """The reply body of a method call, or None if the call failed."""
-    reply = await bus.call(
-        Message(
-            destination=destination,
-            path=path,
-            interface=interface,
-            member=member,
-            signature=signature,
-            body=list(body),
-        )
+    """The reply body of a method call, or None if the call failed.
+
+    A service that does not answer at all (a hung gnome-shell, say) raises
+    TimeoutError rather than stalling presenced.
+    """
+    reply = await asyncio.wait_for(
+        bus.call(
+            Message(
+                destination=destination,
+                path=path,
+                interface=interface,
+                member=member,
+                signature=signature,
+                body=list(body),
+            )
+        ),
+        CALL_TIMEOUT_S,
     )
     if reply is None or reply.message_type == MessageType.ERROR:
         return None

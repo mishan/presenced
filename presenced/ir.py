@@ -36,7 +36,7 @@ MODEL_URL = (
 MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
 
 GRAB_FRAMES = 12
-MAX_FRAMES = 40  # two seconds, for the exposure to catch up with a face that just appeared
+MAX_FRAMES = 40  # two seconds at 20 fps, for the exposure to catch up with a face that just appeared
 DETECT_FROM = 4  # frames before this are still adjusting to the metering region
 DETECT_LAST = 8  # look for faces in this many of the last frames
 CLIPPED = 0.25  # share of the metering region at full white that means "still too bright"
@@ -128,6 +128,7 @@ class IRCamera:
         self.abort = threading.Event()  # set to cut a look short and free the camera
         self.idle = threading.Event()  # set while the camera is not streaming
         self.idle.set()
+        self.gate = threading.Lock()  # makes "not aborted, so open the camera" one step
         self.score_threshold = score_threshold
         self.min_face_px = min_face_width * self.width
         model = model_path()
@@ -158,7 +159,10 @@ class IRCamera:
         """
         size = self.width * self.height
         frames = []
-        self.idle.clear()
+        with self.gate:
+            if self.abort.is_set():  # held off before the camera was even opened
+                return np.zeros((0, self.height, self.width), np.uint8)
+            self.idle.clear()
         try:
             stream = subprocess.Popen(
                 [
@@ -251,6 +255,7 @@ class NoCamera:
         self.abort = threading.Event()
         self.idle = threading.Event()
         self.idle.set()
+        self.gate = threading.Lock()
 
     def look(self):
         return IRReading(0, 0.0, 0.0, True)

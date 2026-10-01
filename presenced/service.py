@@ -1,12 +1,15 @@
 """The presenced daemon: senses presence and publishes it on the session bus."""
 import argparse
 import asyncio
+import inspect
 import logging
 import os
 import signal
 import subprocess
 import sys
 import time
+
+import cv2
 
 from dbus_fast import BusType, MessageType, Variant
 from dbus_fast.aio import MessageBus
@@ -31,7 +34,9 @@ OBJECT_PATH = "/io/github/mishan/Presenced"
 INTERFACE = "io.github.mishan.Presenced1"
 
 SUSPEND_GAP = 5.0  # seconds of boot time the monotonic clock missed: we were asleep
-CAMERA_RELEASE_S = 1.0  # how long a pause or inhibit waits for a look under way to give up the camera
+STEP_WAIT_S = 6.0  # how long a pause or inhibit waits for a check under way to finish
+MAX_FAILURES = 20  # ticks in a row that fail before presenced exits for systemd to restart it
+ACTION_TIMEOUT_S = 60.0  # an action still running after this long is killed
 
 
 class PresenceInterface(ServiceInterface):
@@ -66,23 +71,32 @@ class PresenceInterface(ServiceInterface):
     def Inhibitors(self) -> "a(uss)":
         return [[cookie, held.who, held.why] for cookie, held in self.daemon.controls.inhibitors.items()]
 
+    # Pause and Inhibit reply only once a check under way has finished, so the
+    # speaker and camera are free when the caller hears back. They are marked
+    # as coroutine functions rather than written as ones: the part before the
+    # await runs as the call is dispatched, while the caller's name is known.
+
     @method()
+    @inspect.markcoroutinefunction
     def Pause(self, seconds: "d"):
         try:
             self.daemon.pause(seconds)
         except ValueError as error:
             raise DBusError(ErrorType.INVALID_ARGS, str(error)) from None
+        return self.daemon.step_finished()
 
     @method()
     def Resume(self):
         self.daemon.resume()
 
     @method()
+    @inspect.markcoroutinefunction
     def Inhibit(self, who: "s", why: "s") -> "u":
         try:
-            return self.daemon.inhibit(who, why)
+            cookie = self.daemon.inhibit(who, why)
         except ValueError as error:
             raise DBusError(ErrorType.LIMITS_EXCEEDED, str(error)) from None
+        return self.daemon.step_finished(cookie)
 
     @method()
     def Uninhibit(self, cookie: "u") -> "b":
@@ -109,8 +123,12 @@ class Daemon:
         self.poke = asyncio.Event()
         self.stop = asyncio.Event()
         self.actions = asyncio.Queue()
+        self.stepping = asyncio.Event()  # set while no check is under way
+        self.stepping.set()
         self.last_paused = False
         self.last_error = None
+        self.failures = 0
+        self.exit_code = 0
         self.monitor = monitor or Monitor(
             make_sonar(config.sonar),
             make_camera(config.camera),
@@ -144,6 +162,8 @@ class Daemon:
             command, state = await self.actions.get()
             try:
                 await self.run_action(command, state)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 log.exception("%s action failed: %s", state.value, command)
 
@@ -153,8 +173,17 @@ class Daemon:
         # lock the wrong one: tell the command which session is the desktop
         session_id, _ = await self.desktop.session()
         env = dict(os.environ, PRESENCED_STATE=state.value, PRESENCED_SESSION=session_id or "")
-        process = await asyncio.create_subprocess_shell(command, env=env)
-        code = await process.wait()
+        # its own process group, so a timeout or shutdown takes its children too
+        process = await asyncio.create_subprocess_shell(command, env=env, start_new_session=True)
+        try:
+            code = await asyncio.wait_for(process.wait(), ACTION_TIMEOUT_S)
+        except (TimeoutError, asyncio.CancelledError) as stopped:
+            kill_group(process)
+            await process.wait()
+            if isinstance(stopped, asyncio.CancelledError):
+                raise
+            log.warning("%s action still running after %g s, killed: %s", state.value, ACTION_TIMEOUT_S, command)
+            return
         if code:
             log.warning("%s action exited with status %d: %s", state.value, code, command)
 
@@ -176,18 +205,24 @@ class Daemon:
         self.poke.set()
 
     def hold_now(self):
-        """Freeze the state at once and get the camera back, even mid-look."""
-        self.monitor.hold.set()
+        """Freeze the state at once, and stop a check under way from opening the camera."""
+        self.monitor.freeze()
         camera = self.monitor.camera
-        camera.abort.set()
-        if not camera.idle.wait(CAMERA_RELEASE_S):
-            log.warning("the camera was still busy after %g s", CAMERA_RELEASE_S)
+        with camera.gate:
+            camera.abort.set()
+
+    async def step_finished(self, result=None):
+        """result, once no check is under way any more."""
+        try:
+            await asyncio.wait_for(self.stepping.wait(), STEP_WAIT_S)
+        except TimeoutError:
+            log.warning("a check was still running after %g s", STEP_WAIT_S)
+        return result
 
     def hold(self, mode):
         self.set_mode(mode)
         if not self.monitor.hold.is_set():
-            self.monitor.hold.set()
-            self.monitor.camera.abort.set()
+            self.hold_now()
 
     def release(self):
         if self.monitor.hold.is_set():
@@ -240,6 +275,8 @@ class Daemon:
         if monitor.last_look is not None:
             status["face_score"] = Variant("d", monitor.last_look.score)
             status["camera_blind"] = Variant("b", monitor.last_look.blind)
+        if self.last_error:
+            status["last_error"] = Variant("s", self.last_error)
         return status
 
     def on_message(self, message):
@@ -278,6 +315,11 @@ class Daemon:
         if locked and not self.config.wake.enabled:
             self.hold("locked")
             return
+        if unlocked:
+            # only a person can unlock the screen; count it before anything
+            # below can hold the state, or it would be lost
+            self.release()
+            self.monitor.active()
 
         if not locked and self.config.sensing.respect_idle_inhibitors and await self.desktop.idle_inhibited():
             # a video is playing, say: the desktop will not blank or lock, and neither should we
@@ -285,8 +327,6 @@ class Daemon:
             return
 
         self.release()
-        if unlocked:
-            self.monitor.active()  # only a person can unlock the screen
 
         self.idle_seconds = await self.desktop.idle_seconds()
         if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
@@ -296,24 +336,35 @@ class Daemon:
 
         self.set_mode("watching" if locked else "sensing")
         before = self.monitor.state
-        await asyncio.to_thread(self.monitor.step)
+        self.stepping.clear()
+        try:
+            await asyncio.to_thread(self.monitor.step)
+        finally:
+            self.stepping.set()
         seen = self.monitor.last_look
         if locked and before is State.AWAY and self.monitor.state is State.PRESENT and seen and seen.faces:
             log.info("someone came back: waking the screen")
             await self.waker.wake()
 
     async def safe_tick(self):
-        """A tick that logs what went wrong instead of ending the daemon."""
+        """A tick that logs what went wrong instead of ending the daemon, unless it keeps failing."""
         try:
             await self.tick()
         except Exception as error:
+            self.failures += 1
             summary = f"{type(error).__name__}: {error}"
             if summary != self.last_error:
                 log.exception("sensing failed; carrying on")
                 self.last_error = summary
             else:
                 log.debug("sensing failed again: %s", summary)
+            if self.failures >= MAX_FAILURES:
+                # not getting better by itself: exit, and let systemd start afresh
+                log.error("sensing failed %d times in a row; exiting", self.failures)
+                self.exit_code = 1
+                self.stop.set()
         else:
+            self.failures = 0
             self.last_error = None
 
     async def run(self):
@@ -342,6 +393,10 @@ class Daemon:
         log.info("microphone %s", microphone or f"{self.monitor.sonar.microphone!r} not found")
         log.info("camera %s", self.monitor.camera.device)
         actions = asyncio.ensure_future(self.run_actions())
+        for bus, name in ((session, "session"), (system, "system")):
+            asyncio.ensure_future(bus.wait_for_disconnect()).add_done_callback(
+                lambda _, name=name: self.lost_bus(name)
+            )
         interval = self.config.sensing.interval
         while not self.stop.is_set():
             started = self.loop.time()
@@ -353,10 +408,20 @@ class Daemon:
             for waiting in waits:
                 waiting.cancel()
         log.info("stopping")
+        self.stopping = True
         actions.cancel()
+        await asyncio.gather(actions, return_exceptions=True)  # kills a running action
         session.disconnect()
         system.disconnect()
-        return 0
+        return self.exit_code
+
+    def lost_bus(self, name):
+        if getattr(self, "stopping", False):
+            return
+        # every call would fail from now on: exit, and let systemd reconnect us
+        log.error("lost the %s bus; exiting", name)
+        self.exit_code = 1
+        self.stop.set()
 
 
 def make_sonar(config):
@@ -371,9 +436,16 @@ def make_camera(config):
         return NoCamera()
     try:
         return IRCamera(config.device, config.score_threshold, config.min_face_width)
-    except (LookupError, FileNotFoundError, OSError, subprocess.SubprocessError) as error:
+    except (LookupError, FileNotFoundError, OSError, subprocess.SubprocessError, cv2.error) as error:
         log.warning("no camera, sensing with the sonar alone: %s", error)
         return NoCamera()
+
+
+def kill_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def main():

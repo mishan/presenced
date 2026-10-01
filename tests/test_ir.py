@@ -99,3 +99,33 @@ def test_no_strobe_means_blind():
 def test_a_cut_short_look_gives_up_the_camera():
     cam = camera(np.zeros((0, 360, 640), np.uint8), None)
     assert cam.look().blind
+
+
+def test_a_held_camera_is_not_even_opened(monkeypatch):
+    import threading
+
+    cam = object.__new__(ir.IRCamera)
+    cam.width, cam.height = 640, 360
+    cam.abort, cam.idle, cam.gate = threading.Event(), threading.Event(), threading.Lock()
+    cam.idle.set()
+    cam.abort.set()
+
+    def no_popen(*args, **kwargs):
+        raise AssertionError("the camera was opened")
+
+    monkeypatch.setattr(ir.subprocess, "Popen", no_popen)
+    assert len(ir.IRCamera.grab(cam)) == 0
+    assert cam.idle.is_set()
+
+
+def test_a_corrupt_model_falls_back_to_sonar_alone(monkeypatch):
+    import cv2
+
+    from presenced.config import Camera
+    from presenced import service
+
+    def corrupt(*args, **kwargs):
+        raise cv2.error("failed to parse the model")
+
+    monkeypatch.setattr(service, "IRCamera", corrupt)
+    assert isinstance(service.make_camera(Camera()), ir.NoCamera)

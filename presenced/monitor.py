@@ -47,24 +47,32 @@ class Monitor:
         self.last_sonar = None
         self.last_look = None
         # while set, the state is frozen: a step already under way when sensing
-        # was paused or inhibited must not switch it, or run an action
+        # was paused or inhibited must not switch it, or run an action. The
+        # gate makes setting the hold and switching state exclusive, so a
+        # switch either finished before the hold or does not happen at all
         self.hold = threading.Event()
+        self.gate = threading.Lock()
 
     @property
     def quiet_seconds(self):
         return 0.0 if self.quiet_since is None else self.clock() - self.quiet_since
 
+    def freeze(self):
+        with self.gate:
+            self.hold.set()
+
     def switch(self, state):
-        if state is self.state or self.hold.is_set():
-            return
-        self.state = state
-        self.quiet_since = None if state is State.PRESENT else self.clock()
-        self.missed_at = None
-        self.looked_at = None
-        self.blind_at = None
-        log.info("now %s", state.value)
-        if self.on_change:
-            self.on_change(state)
+        with self.gate:
+            if state is self.state or self.hold.is_set():
+                return
+            self.state = state
+            self.quiet_since = None if state is State.PRESENT else self.clock()
+            self.missed_at = None
+            self.looked_at = None
+            self.blind_at = None
+            log.info("now %s", state.value)
+            if self.on_change:
+                self.on_change(state)
 
     def active(self):
         """Something other than the sensors showed the user is here: input, an unlock."""
@@ -79,7 +87,7 @@ class Monitor:
         self.blind_at = None
 
     def look(self):
-        seen = self.camera.look()
+        seen = self.camera.look()  # returns at once, blind, if held meanwhile
         self.last_look = seen
         log.debug(
             "camera: faces=%d score=%.2f near=%.0f%% blind=%s",
@@ -92,6 +100,8 @@ class Monitor:
             return
         now = self.clock()
         reading = self.sonar.probe()
+        if self.hold.is_set():
+            return  # paused or inhibited during the probe: leave the camera alone
         self.last_sonar = reading
         moving = reading.usable and reading.motion_db > self.threshold_db
         if moving:

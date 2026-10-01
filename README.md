@@ -14,8 +14,8 @@ from other laptops are very welcome.
 - **Input first.** While you are typing or moving the mouse you are obviously
   there, so nothing else runs. Sensing starts after a few seconds without
   input. Likewise, while a browser or video player has asked the desktop not
-  to go idle (during playback), you count as present, just as the desktop
-  itself will not blank or lock the screen then.
+  to go idle (during playback), nothing is sensed and nothing changes, just
+  as the desktop itself will not blank or lock the screen then.
 - **Sonar.** Every few seconds the speaker plays a short, inaudible 20 kHz
   tone and the microphones record it. In an empty room the returned tone holds
   still; a person in front of the laptop makes it wander. This is cheap, but it
@@ -47,7 +47,7 @@ do that. After a suspend, sensing simply starts counting again.
 
 - Linux with PipeWire (`pw-play`, `pw-record` and `pw-dump`)
 - `v4l2-ctl` (from v4l-utils) for the IR camera
-- Python 3.11 or newer
+- Python 3.12 or newer
 - A laptop with built-in speakers and microphones that pass 20 kHz (most do;
   `presencectl calibrate` tells you), and ideally an IR camera
 - For input idle time: GNOME, or a desktop that implements
@@ -115,7 +115,9 @@ method, and never will be; face unlock belongs to tools like
 [Howdy](https://github.com/boltgolt/howdy), which work at the lock screen and
 need the IR camera to themselves. presenced only uses the camera for under two
 seconds at a time, and such a tool can hold presenced off entirely with an
-inhibitor (see D-Bus below).
+inhibitor (see D-Bus below). `Pause` and `Inhibit` reply only once any check
+under way has finished, so the camera and speaker are free when the caller
+hears back.
 
 ## Use
 
@@ -157,7 +159,8 @@ crashes cannot leave sensing off.
 
 Audio and camera frames are analyzed in memory and never stored or sent
 anywhere. The microphones record only while a tone plays, and the camera runs
-for under two seconds per look. The camera LED lights for each look.
+for about two seconds at most per look (40 frames). The camera LED lights for
+each look.
 
 ## Limits
 
@@ -175,6 +178,8 @@ for under two seconds per look. The camera LED lights for each look.
   output currently playing through a speaker, never headphones, HDMI or
   Bluetooth, whatever the `speaker` setting matches.
 - **No IR camera?** presenced runs on the sonar alone, and says so in its log.
+- **If presenced loses the session or system bus, or sensing fails a minute
+  in a row,** it exits with an error so that systemd starts it afresh.
 - **Sitting very still for a long time** means the camera looks now and then
   (once per `quiet_for`) to make sure you are still there.
 - **Only faces count,** and only faces close enough to be at the laptop.

@@ -21,6 +21,7 @@ class FakeCamera:
         self.abort = threading.Event()
         self.idle = threading.Event()
         self.idle.set()
+        self.gate = threading.Lock()
 
 
 class FakeMonitor:
@@ -49,6 +50,9 @@ class FakeMonitor:
 
     def restart(self):
         self.restarts += 1
+
+    def freeze(self):
+        self.hold.set()
 
 
 class FakeDesktop:
@@ -233,6 +237,103 @@ def test_bad_pause_lengths_are_refused_over_dbus():
         with pytest.raises(DBusError):
             interface.Pause(seconds)
     assert not d.controls.paused
+
+
+def dispatched(name):
+    """The function dbus-fast calls for a method, rather than its Python-side wrapper."""
+    return PresenceInterface.__dict__[name].__dict__["__DBUS_METHOD"].fn
+
+
+def test_pause_and_inhibit_are_coroutines_to_dbus():
+    import inspect
+
+    assert inspect.iscoroutinefunction(dispatched("Pause"))
+    assert inspect.iscoroutinefunction(dispatched("Inhibit"))
+
+
+def test_inhibit_replies_only_once_the_check_under_way_is_done():
+    d, monitor, waker = daemon()
+    interface = PresenceInterface(d)
+
+    async def run():
+        d.stepping.clear()  # a check is under way
+        d.sender = ":1.5"
+        reply = asyncio.ensure_future(dispatched("Inhibit")(interface, "howdy", "face unlock"))
+        d.sender = ":1.9"  # the next call arrives before this one is answered
+        await asyncio.sleep(0.05)
+        assert not reply.done()
+        assert monitor.hold.is_set() and monitor.camera.abort.is_set()
+        d.stepping.set()
+        return await reply
+
+    cookie = asyncio.run(run())
+    assert d.controls.inhibitors[cookie].owner == ":1.5"
+
+
+def test_an_unlock_just_before_a_video_still_counts():
+    d, monitor, waker = daemon(wake=False)
+    tick(d)  # locked
+    d.desktop.is_locked = False
+    d.desktop.inhibited = True  # and a video resumes straight away
+    tick(d)
+    assert monitor.state is State.PRESENT
+    assert d.mode == "held"
+
+
+def test_a_minute_of_failures_ends_the_daemon_for_systemd_to_restart():
+    from presenced.service import MAX_FAILURES
+
+    d, monitor, waker = daemon(locked=False)
+
+    async def broken():
+        raise TimeoutError("gnome-shell is not answering")
+
+    d.desktop.locked = broken
+
+    async def run():
+        d.loop = asyncio.get_running_loop()
+        for _ in range(MAX_FAILURES - 1):
+            await d.safe_tick()
+        assert not d.stop.is_set()
+        await d.safe_tick()
+
+    asyncio.run(run())
+    assert d.stop.is_set() and d.exit_code == 1
+
+
+def test_one_good_tick_resets_the_failure_count():
+    d, monitor, waker = daemon(locked=False)
+    d.failures = 10
+    tick(d)
+
+    async def run():
+        d.loop = asyncio.get_running_loop()
+        await d.safe_tick()
+
+    asyncio.run(run())
+    assert d.failures == 0
+
+
+def test_losing_the_bus_ends_the_daemon():
+    d, monitor, waker = daemon()
+    d.lost_bus("system")
+    assert d.stop.is_set() and d.exit_code == 1
+
+
+def test_an_action_that_hangs_is_killed(monkeypatch, caplog):
+    from presenced import service
+
+    monkeypatch.setattr(service, "ACTION_TIMEOUT_S", 0.2)
+    d, monitor, waker = daemon()
+
+    async def session():
+        return "2", "/org/freedesktop/login1/session/_32"
+
+    d.desktop.session = session
+    started = __import__("time").monotonic()
+    asyncio.run(d.run_action("sleep 30", State.AWAY))
+    assert __import__("time").monotonic() - started < 5
+    assert "killed" in caplog.text
 
 
 def test_suspend_restarts_the_count_without_changing_the_state():

@@ -63,30 +63,38 @@ def matches(props, hint):
 
 
 def active_routes(objects):
-    """{(device id, profile device index): active route name} for every audio device."""
+    """{(device id, direction, profile device index): name} of every route in use."""
     routes = {}
     for obj in objects:
         info = obj.get("info") or {}
         for route in (info.get("params") or {}).get("Route", []):
-            for index in route.get("devices", []):
+            # an active route names the one profile device it is playing on
+            indexes = [route["device"]] if "device" in route else route.get("devices", [])
+            for index in indexes:
                 routes[(obj.get("id"), route.get("direction"), index)] = (
                     f"{route.get('name', '')} {route.get('description', '')}"
                 )
     return routes
 
 
+INTERNAL_BUSES = ("pci", "platform")  # built-in sound; not usb or bluetooth
+NOT_A_SPEAKER = ("headphone", "headset", "hdmi", "displayport", "line", "usb", "bluetooth")
+
+
 def is_laptop_speaker(props, routes):
-    """Whether a sink is a built-in speaker, and not headphones, HDMI or Bluetooth.
+    """Whether a sink is a built-in speaker, and not headphones, HDMI, USB or Bluetooth.
 
     PipeWire reports the output route each sink currently plays through; where
-    it does not, fall back to the sink's own name.
+    it does not, the sink's own name has to do.
     """
-    if props.get("device.api") != "alsa":
+    if props.get("device.api") != "alsa" or props.get("device.bus") not in INTERNAL_BUSES:
         return False
+    names = f"{props['node.name']} {props.get('node.description', '')}".lower()
     route = routes.get((props.get("device.id"), "Output", props.get("card.profile.device")))
-    text = route if route is not None else f"{props['node.name']} {props.get('node.description', '')}"
-    text = text.lower()
-    return "speaker" in text and not any(word in text for word in ("headphone", "headset", "hdmi", "line"))
+    playing_through = (route or names).lower()
+    return "speaker" in playing_through and not any(
+        word in text for text in (playing_through, names) for word in NOT_A_SPEAKER
+    )
 
 
 def find_node(media_class, hint, objects=None):

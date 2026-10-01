@@ -210,3 +210,21 @@ def test_restart_forgets_the_quiet_run_but_keeps_the_state():
     assert mon.state is State.PRESENT
     run_for(fake, mon, 27)
     assert fake.looks == 1  # a full new quiet period is needed before the next look
+
+
+def test_a_hold_set_during_the_probe_keeps_the_camera_shut():
+    fake, mon = monitor()
+    fake.reading = QUIET
+    fake.seen = EMPTY
+    run_for(fake, mon, 30)
+    looks = fake.looks
+    original = fake.probe
+
+    def probe_then_pause():
+        mon.freeze()
+        return original()
+
+    fake.probe = probe_then_pause
+    run_for(fake, mon, 30)
+    assert fake.looks == looks
+    assert mon.state is State.PRESENT

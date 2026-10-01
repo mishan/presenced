@@ -31,6 +31,7 @@ REL_X, REL_Y = 0, 1
 BTN_LEFT = 0x110
 BUS_VIRTUAL = 0x06
 SETTLE_S = 1.0  # the compositor has to notice the new device before it listens to it
+COMMAND_TIMEOUT_S = 10.0
 
 
 def nudge():
@@ -68,7 +69,13 @@ class Waker:
         """Wake the screen; whether that worked."""
         if self.command:
             process = await asyncio.create_subprocess_shell(self.command)
-            return await process.wait() == 0
+            try:
+                return await asyncio.wait_for(process.wait(), COMMAND_TIMEOUT_S) == 0
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                log.warning("wake command still running after %g s, killed", COMMAND_TIMEOUT_S)
+                return False
         try:
             await asyncio.to_thread(nudge)
             return True

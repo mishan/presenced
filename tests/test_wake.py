@@ -16,3 +16,15 @@ def test_a_missing_uinput_is_a_warning_not_a_crash(monkeypatch, caplog):
     assert asyncio.run(waker.wake()) is False
     assert asyncio.run(waker.wake()) is False
     assert caplog.text.count("cannot wake the screen") == 1
+
+
+def test_a_wake_command_that_hangs_is_killed(monkeypatch):
+    import asyncio
+    import time
+
+    from presenced import wake
+
+    monkeypatch.setattr(wake, "COMMAND_TIMEOUT_S", 0.2)
+    started = time.monotonic()
+    assert asyncio.run(wake.Waker("sleep 30").wake()) is False
+    assert time.monotonic() - started < 5
