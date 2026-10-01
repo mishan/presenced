@@ -56,19 +56,36 @@ do that. After a suspend, sensing simply starts counting again.
 
 ## Install
 
-    pipx install git+https://github.com/mishan/presenced
-    presencectl fetch-model          # the face detector, about 230 KB
-    presencectl calibrate --write    # fit the sonar to your laptop and room
-    presencectl install-service --enable
+    git clone https://github.com/mishan/presenced
+    cd presenced
+    ./install.sh
 
-Calibration plays some beeps and asks you to leave the room for about half a
-minute, so it can measure the empty room.
+The installer works entirely in your home directory and never needs root. It
+puts presenced in its own virtual environment under `~/.local/share/presenced`,
+links `presenced` and `presencectl` into `~/.local/bin`, downloads the face
+detection model (about 230 KB), writes `~/.config/presenced/config.toml`
+(asking whether to lock the screen when you leave and wake it when you come
+back), and starts presenced as a systemd user service. If system packages
+are missing, it lists them with the command to install them on your
+distribution, and stops.
+
+Then calibrate once, in a quiet room:
+
+    presencectl calibrate --write
+
+It plays some beeps and asks you to leave the room for about half a minute,
+to measure the room empty. `./install.sh --calibrate` does this as part of
+installing.
+
+Run `./install.sh` again after pulling to upgrade; your settings are kept.
+`./install.sh --uninstall` removes presenced but keeps your settings, and
+`--uninstall --purge` removes those too. `./install.sh --help` lists the rest.
 
 ## Configure
 
 Settings live in `~/.config/presenced/config.toml`. Every setting is optional;
-`calibrate --write` creates the file with all of them and their defaults. The
-one you will want is an action:
+the installer (or `presencectl init-config`) writes the file with all of them
+and their defaults. The one you will want is an action:
 
 ```toml
 [actions]

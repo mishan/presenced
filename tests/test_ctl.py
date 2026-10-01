@@ -17,3 +17,21 @@ def test_durations(text, seconds):
 def test_bad_durations(text):
     with pytest.raises(argparse.ArgumentTypeError):
         parse_duration(text)
+
+
+def test_init_config_writes_a_complete_file_and_keeps_an_existing_one(tmp_path):
+    import asyncio
+
+    from presenced.config import load
+    from presenced.ctl import LOCK_ACTION, cmd_init_config
+
+    path = tmp_path / "presenced" / "config.toml"
+    args = argparse.Namespace(config=str(path), lock=True, wake=True, force=False)
+    asyncio.run(cmd_init_config(args))
+    config = load(path)
+    assert config.actions.on_away == LOCK_ACTION
+    assert config.wake.enabled
+
+    path.write_text("# mine\n")
+    asyncio.run(cmd_init_config(args))
+    assert path.read_text() == "# mine\n"

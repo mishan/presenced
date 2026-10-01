@@ -1,5 +1,6 @@
-# systemd user unit. `presencectl install-service` writes one of these with the
-# path of your presenced executable filled in; this copy assumes pipx.
+# systemd user unit. install.sh (through `presencectl install-service`) writes
+# one of these with the path of your presenced executable filled in; this copy
+# assumes install.sh's default location.
 [Unit]
 Description=Presence detection from the speaker, microphones and IR camera
 Documentation=https://github.com/mishan/presenced
@@ -9,7 +10,7 @@ After=graphical-session.target pipewire.service wireplumber.service
 [Service]
 Type=dbus
 BusName=io.github.mishan.Presenced
-ExecStart=%h/.local/bin/presenced
+ExecStart=%h/.local/share/presenced/venv/bin/presenced
 Restart=on-failure
 RestartSec=5
 # a bad configuration (2) or another presenced already running (3) will not

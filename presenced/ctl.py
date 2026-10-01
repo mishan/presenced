@@ -15,7 +15,7 @@ from dbus_fast import BusType, Message, MessageType
 from dbus_fast.aio import MessageBus
 
 from . import __version__
-from .config import DEFAULT_PATH, ConfigError, load
+from .config import DEFAULT_PATH, Config, ConfigError, load, render
 
 BUS_NAME = "io.github.mishan.Presenced"
 OBJECT_PATH = "/io/github/mishan/Presenced"
@@ -261,6 +261,23 @@ async def cmd_calibrate(args):
     print(f"Saved to {path}. Restart presenced to use them: systemctl --user restart presenced")
 
 
+LOCK_ACTION = "loginctl lock-session $PRESENCED_SESSION"
+
+
+async def cmd_init_config(args):
+    path = Path(args.config) if args.config else DEFAULT_PATH
+    if path.exists() and not args.force:
+        print(f"{path} already exists; leaving it as it is")
+        return
+    config = Config()
+    if args.lock:
+        config.actions.on_away = LOCK_ACTION
+    config.wake.enabled = args.wake
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render(config))
+    print(f"wrote {path}")
+
+
 async def cmd_fetch_model(args):
     from .ir import fetch_model
 
@@ -327,6 +344,13 @@ def main():
     calibrate.add_argument("-c", "--config", help="configuration file")
     calibrate.add_argument("--write", action="store_true", help="save the results to the configuration file")
     calibrate.set_defaults(func=cmd_calibrate)
+
+    init = commands.add_parser("init-config", help="write a configuration file with every setting")
+    init.add_argument("-c", "--config", help="where to write it")
+    init.add_argument("--lock", action="store_true", help="lock the screen when you leave")
+    init.add_argument("--wake", action="store_true", help="wake the screen when you come back")
+    init.add_argument("--force", action="store_true", help="replace an existing file")
+    init.set_defaults(func=cmd_init_config)
 
     commands.add_parser("fetch-model", help="download the face detection model").set_defaults(func=cmd_fetch_model)
 
