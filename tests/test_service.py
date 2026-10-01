@@ -34,6 +34,7 @@ class FakeMonitor:
         self.last_look = None
         self.last_sonar = None
         self.sonar = type("Sonar", (), {"found": ("sink", "source"), "speaker": "speaker", "microphone": "mic"})()
+        self.sonar.abort = threading.Event()
         self.camera = FakeCamera()
         self.hold = threading.Event()
         self.on_change = None
@@ -281,9 +282,11 @@ def test_an_unlock_just_before_a_video_still_counts():
 
 
 def test_a_minute_of_failures_ends_the_daemon_for_systemd_to_restart():
-    from presenced.service import MAX_FAILURES
+    from presenced.service import FAILING_FOR_S
 
     d, monitor, waker = daemon(locked=False)
+    now = [100.0]
+    d.clock = lambda: now[0]
 
     async def broken():
         raise TimeoutError("gnome-shell is not answering")
@@ -292,26 +295,63 @@ def test_a_minute_of_failures_ends_the_daemon_for_systemd_to_restart():
 
     async def run():
         d.loop = asyncio.get_running_loop()
-        for _ in range(MAX_FAILURES - 1):
-            await d.safe_tick()
+        await d.safe_tick()
+        now[0] += FAILING_FOR_S - 1
+        await d.safe_tick()
         assert not d.stop.is_set()
+        now[0] += 1
         await d.safe_tick()
 
     asyncio.run(run())
     assert d.stop.is_set() and d.exit_code == 1
 
 
-def test_one_good_tick_resets_the_failure_count():
+def test_one_good_tick_resets_the_failure_clock():
     d, monitor, waker = daemon(locked=False)
-    d.failures = 10
-    tick(d)
+    d.failing_since = 5.0
 
     async def run():
         d.loop = asyncio.get_running_loop()
         await d.safe_tick()
 
     asyncio.run(run())
-    assert d.failures == 0
+    assert d.failing_since is None
+
+
+def test_a_pause_during_the_desktop_queries_is_not_undone():
+    d, monitor, waker = daemon(locked=False)
+    interface = PresenceInterface(d)
+
+    async def run():
+        d.loop = asyncio.get_running_loop()
+        gate = asyncio.Event()
+
+        async def slow_locked():
+            await gate.wait()  # logind is slow to answer
+            return False
+
+        d.desktop.locked = slow_locked
+        ticking = asyncio.ensure_future(d.tick())
+        await asyncio.sleep(0.01)
+        d.sender = ":1.5"
+        reply = asyncio.ensure_future(dispatched("Pause")(interface, 30.0))
+        await asyncio.sleep(0.01)
+        assert not reply.done()  # no reply while the tick is still under way
+        gate.set()
+        await ticking
+        await reply
+
+    asyncio.run(run())
+    assert monitor.steps == 0  # the check did not go ahead
+    assert monitor.hold.is_set() and monitor.camera.abort.is_set() and monitor.sonar.abort.is_set()
+    assert d.mode == "paused"
+
+
+def test_a_hold_is_never_lifted_while_paused():
+    d, monitor, waker = daemon(locked=False)
+    d.pause(30)
+    assert d.release() is False
+    assert monitor.hold.is_set()
 
 
 def test_losing_the_bus_ends_the_daemon():
@@ -398,3 +438,12 @@ def test_actions_run_one_at_a_time_in_order():
 
     asyncio.run(run())
     assert ran == ["start lock", "end lock", "start hello", "end hello"]
+
+
+def test_the_service_unit_does_not_restart_on_permanent_errors():
+    from presenced.ctl import UNIT
+    from presenced.service import EXIT_CONFIG, EXIT_TAKEN
+
+    assert f"RestartPreventExitStatus={EXIT_CONFIG} {EXIT_TAKEN}" in UNIT
+    with open("contrib/presenced.service") as unit:
+        assert f"RestartPreventExitStatus={EXIT_CONFIG} {EXIT_TAKEN}" in unit.read()

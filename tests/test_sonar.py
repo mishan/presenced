@@ -141,13 +141,26 @@ def test_a_usb_headset_that_calls_itself_a_speaker_is_refused():
     assert find_node("Audio/Sink", "speaker", objects) is None
 
 
-def test_a_headset_named_in_the_description_is_refused_even_on_a_speaker_route():
+def test_a_plain_hda_laptop_speaker_is_found_by_its_route():
+    from presenced.sonar import find_node
+
+    # most Intel and AMD laptops: one stereo output, and only the route says speaker
+    objects = [
+        sink(74, "alsa_output.pci-0000_00_1f.3.analog-stereo", "Built-in Audio Analog Stereo", index=0),
+        card(67, [(0, "analog-output-speaker")]),
+    ]
+    assert find_node("Audio/Sink", "speaker", objects) == "alsa_output.pci-0000_00_1f.3.analog-stereo"
+
+
+def test_a_shared_speaker_and_headphone_output_follows_its_route():
     from presenced.sonar import find_node
 
     objects = [
-        sink(74, "alsa_output.pci.analog-stereo", "Headset Speaker", index=0),
-        card(67, [(0, "analog-output-speaker")]),
+        sink(74, "alsa_output.pci-sof.HiFi__Speaker__sink", "Meteor Lake Speaker + Headphones", index=0),
+        card(67, [(0, "[Out] Speaker")]),
     ]
+    assert find_node("Audio/Sink", "speaker", objects) == "alsa_output.pci-sof.HiFi__Speaker__sink"
+    objects[1] = card(67, [(0, "[Out] Headphones")])
     assert find_node("Audio/Sink", "speaker", objects) is None
 
 
@@ -166,3 +179,17 @@ def test_the_route_a_sink_actually_plays_on_decides():
         },
     ]
     assert find_node("Audio/Sink", "", objects) is None
+
+
+def test_a_hold_cuts_a_playing_tone_short(monkeypatch):
+    import threading
+    import time
+
+    from presenced import sonar
+
+    monkeypatch.setattr(sonar, "player_command", lambda sink: ["sleep", "30"])
+    player = sonar.Sonar()
+    threading.Timer(0.2, player.abort.set).start()
+    started = time.monotonic()
+    assert player.play(sonar.make_tone(20000.0, 5.0), sink="speaker") is False
+    assert time.monotonic() - started < 2

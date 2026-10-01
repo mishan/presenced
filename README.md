@@ -175,11 +175,15 @@ each look.
   headphones are plugged in, the sonar cannot hear anything and presenced
   relies on the camera alone. The tone is only ever sent to the laptop's own
   speaker: a sink counts only if PipeWire reports it as a built-in (ALSA)
-  output currently playing through a speaker, never headphones, HDMI or
-  Bluetooth, whatever the `speaker` setting matches.
+  output currently playing through a speaker, never headphones, HDMI, USB or
+  Bluetooth, whatever the `speaker` setting matches. When an output is shared
+  between the speaker and the headphone jack, the route it is playing through
+  at that moment decides.
 - **No IR camera?** presenced runs on the sonar alone, and says so in its log.
-- **If presenced loses the session or system bus, or sensing fails a minute
-  in a row,** it exits with an error so that systemd starts it afresh.
+- **If presenced loses the session or system bus, or sensing keeps failing
+  for a minute,** it exits with an error so that systemd starts it afresh. A
+  bad configuration or a second copy already running exits too, and is not
+  restarted.
 - **Sitting very still for a long time** means the camera looks now and then
   (once per `quiet_for`) to make sure you are still there.
 - **Only faces count,** and only faces close enough to be at the laptop.

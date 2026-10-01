@@ -10,6 +10,7 @@ import logging
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 
@@ -57,11 +58,6 @@ def pipewire_objects():
         return []
 
 
-def matches(props, hint):
-    text = f"{props['node.name']} {props.get('node.description', '')}"
-    return props["node.name"] == hint or hint.lower() in text.lower()
-
-
 def active_routes(objects):
     """{(device id, direction, profile device index): name} of every route in use."""
     routes = {}
@@ -81,27 +77,34 @@ INTERNAL_BUSES = ("pci", "platform")  # built-in sound; not usb or bluetooth
 NOT_A_SPEAKER = ("headphone", "headset", "hdmi", "displayport", "line", "usb", "bluetooth")
 
 
+def output_route(props, routes):
+    """The route a sink is playing through now, or None if PipeWire does not say."""
+    return routes.get((props.get("device.id"), "Output", props.get("card.profile.device")))
+
+
 def is_laptop_speaker(props, routes):
     """Whether a sink is a built-in speaker, and not headphones, HDMI, USB or Bluetooth.
 
-    PipeWire reports the output route each sink currently plays through; where
-    it does not, the sink's own name has to do.
+    The route a sink is playing through decides: one output can serve both the
+    speaker and the headphone jack ("Speaker + Headphones"), and only the
+    route says which is in use. Only where PipeWire reports no route does the
+    sink's own name have to do.
     """
     if props.get("device.api") != "alsa" or props.get("device.bus") not in INTERNAL_BUSES:
         return False
-    names = f"{props['node.name']} {props.get('node.description', '')}".lower()
-    route = routes.get((props.get("device.id"), "Output", props.get("card.profile.device")))
-    playing_through = (route or names).lower()
-    return "speaker" in playing_through and not any(
-        word in text for text in (playing_through, names) for word in NOT_A_SPEAKER
-    )
+    route = output_route(props, routes)
+    text = (route or f"{props['node.name']} {props.get('node.description', '')}").lower()
+    return "speaker" in text and not any(word in text for word in NOT_A_SPEAKER)
 
 
 def find_node(media_class, hint, objects=None):
     """Name of the PipeWire node of a class that is, or matches, hint; None if absent.
 
     Speakers must also be the laptop's own: the tone is never sent anywhere
-    else, whatever the hint says.
+    else, whatever the hint says. The hint is matched against the route a
+    sink plays through as well as its name, since on many laptops only the
+    route mentions the speaker ("Built-in Audio Analog Stereo", playing
+    through "Speakers").
     """
     objects = pipewire_objects() if objects is None else objects
     candidates = [
@@ -109,11 +112,16 @@ def find_node(media_class, hint, objects=None):
         for props in ((obj.get("info") or {}).get("props") or {} for obj in objects)
         if props.get("media.class") == media_class and "node.name" in props
     ]
+    routes = {}
     if media_class == "Audio/Sink":
         routes = active_routes(objects)
         candidates = [props for props in candidates if is_laptop_speaker(props, routes)]
+
+    def described(props):
+        return f"{props['node.name']} {props.get('node.description', '')} {output_route(props, routes) or ''}"
+
     exact = [props for props in candidates if props["node.name"] == hint]
-    matching = exact or [props for props in candidates if matches(props, hint)]
+    matching = exact or [props for props in candidates if hint.lower() in described(props).lower()]
     return matching[0]["node.name"] if matching else None
 
 
@@ -172,6 +180,7 @@ def analyze(samples, tone_hz):
 
 class Sonar:
     def __init__(self, tone_hz=20000.0, burst_s=1.4, speaker="speaker", microphone="digital microphone"):
+        self.abort = threading.Event()  # set to cut a tone short when sensing is held off
         self.tone_hz = tone_hz
         self.speaker = speaker
         self.microphone = microphone
@@ -188,22 +197,32 @@ class Sonar:
         return self.found
 
     def play(self, pcm, sink=None):
-        """Play samples on the speaker only; False if it is not there."""
+        """Play samples on the speaker only; False if it is not there, or if cut short."""
         sink = sink or self.nodes()[0]
-        if sink is None:
+        if sink is None or self.abort.is_set():
             return False
-        seconds = len(pcm) / (RATE * CHANNELS * 2)
+        deadline = time.monotonic() + len(pcm) / (RATE * CHANNELS * 2) + PLAY_SLACK_S
         try:
-            result = subprocess.run(
-                ["pw-play", *STREAM, "--target", sink, "-P", PLAYBACK_PROPERTIES, "-"],
-                input=pcm,
-                stderr=subprocess.DEVNULL,
-                timeout=seconds + PLAY_SLACK_S,
+            player = subprocess.Popen(
+                player_command(sink), stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except OSError as error:
             log.debug("pw-play failed: %s", error)
             return False
-        return result.returncode == 0
+        pending = pcm
+        try:
+            while True:
+                try:
+                    player.communicate(pending, timeout=0.1)
+                    return player.returncode == 0
+                except subprocess.TimeoutExpired:
+                    pending = None  # handed over already; communicate keeps feeding it
+                if self.abort.is_set() or time.monotonic() > deadline:
+                    return False
+        finally:
+            if player.poll() is None:
+                player.kill()
+                player.wait()
 
     def probe(self):
         """Play one burst and return what came back."""
@@ -237,10 +256,17 @@ class Sonar:
         return analyze(pcm.reshape(-1, CHANNELS) / 32768.0, self.tone_hz)
 
 
+def player_command(sink):
+    return ["pw-play", *STREAM, "--target", sink, "-P", PLAYBACK_PROPERTIES, "-"]
+
+
 class NoSonar:
     """Stands in when the sonar is turned off."""
 
     speaker = microphone = "disabled"
+
+    def __init__(self):
+        self.abort = threading.Event()
     found = ("disabled", "disabled")
 
     def nodes(self):

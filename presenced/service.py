@@ -35,7 +35,9 @@ INTERFACE = "io.github.mishan.Presenced1"
 
 SUSPEND_GAP = 5.0  # seconds of boot time the monotonic clock missed: we were asleep
 STEP_WAIT_S = 6.0  # how long a pause or inhibit waits for a check under way to finish
-MAX_FAILURES = 20  # ticks in a row that fail before presenced exits for systemd to restart it
+FAILING_FOR_S = 60.0  # how long ticks may keep failing before presenced exits for systemd to restart it
+EXIT_CONFIG = 2  # a bad configuration: restarting will not help
+EXIT_TAKEN = 3  # another presenced owns the bus name: restarting will not help either
 ACTION_TIMEOUT_S = 60.0  # an action still running after this long is killed
 
 
@@ -123,12 +125,13 @@ class Daemon:
         self.poke = asyncio.Event()
         self.stop = asyncio.Event()
         self.actions = asyncio.Queue()
-        self.stepping = asyncio.Event()  # set while no check is under way
+        self.stepping = asyncio.Event()  # set while no check (tick) is under way
         self.stepping.set()
         self.last_paused = False
         self.last_error = None
-        self.failures = 0
+        self.failing_since = None
         self.exit_code = 0
+        self.clock = time.monotonic
         self.monitor = monitor or Monitor(
             make_sonar(config.sonar),
             make_camera(config.camera),
@@ -205,8 +208,9 @@ class Daemon:
         self.poke.set()
 
     def hold_now(self):
-        """Freeze the state at once, and stop a check under way from opening the camera."""
+        """Freeze the state at once, and stop a check under way from using the speaker or camera."""
         self.monitor.freeze()
+        self.monitor.sonar.abort.set()
         camera = self.monitor.camera
         with camera.gate:
             camera.abort.set()
@@ -224,11 +228,21 @@ class Daemon:
         if not self.monitor.hold.is_set():
             self.hold_now()
 
+    @property
+    def controlled(self):
+        return self.controls.paused or self.controls.inhibited
+
     def release(self):
+        # a pause or inhibit may have arrived while this tick awaited the desktop:
+        # it, not the reasons this tick had, decides
+        if self.controlled:
+            return False
         if self.monitor.hold.is_set():
             self.monitor.hold.clear()
+            self.monitor.sonar.abort.clear()
             self.monitor.camera.abort.clear()
             self.monitor.restart()  # whatever was counted before the hold is stale now
+        return True
 
     def pause(self, seconds):
         self.controls.pause(seconds)
@@ -297,6 +311,14 @@ class Daemon:
         return None
 
     async def tick(self):
+        """One round of sensing; pause and inhibit replies wait until it is over."""
+        self.stepping.clear()
+        try:
+            await self.sense()
+        finally:
+            self.stepping.set()
+
+    async def sense(self):
         offset = self.boot_offset()
         if offset - self.sleep_offset > SUSPEND_GAP:
             log.info("resumed from suspend")
@@ -305,7 +327,7 @@ class Daemon:
 
         if self.controls.paused != self.last_paused:
             self.controls_changed()  # a timed pause ran out
-        if self.controls.paused or self.controls.inhibited:
+        if self.controlled:
             self.hold("paused" if self.controls.paused else "inhibited")
             return
 
@@ -315,10 +337,9 @@ class Daemon:
         if locked and not self.config.wake.enabled:
             self.hold("locked")
             return
-        if unlocked:
+        if unlocked and self.release():
             # only a person can unlock the screen; count it before anything
             # below can hold the state, or it would be lost
-            self.release()
             self.monitor.active()
 
         if not locked and self.config.sensing.respect_idle_inhibitors and await self.desktop.idle_inhibited():
@@ -326,7 +347,9 @@ class Daemon:
             self.hold("held")
             return
 
-        self.release()
+        if not self.release():
+            self.hold("paused" if self.controls.paused else "inhibited")
+            return
 
         self.idle_seconds = await self.desktop.idle_seconds()
         if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
@@ -336,11 +359,7 @@ class Daemon:
 
         self.set_mode("watching" if locked else "sensing")
         before = self.monitor.state
-        self.stepping.clear()
-        try:
-            await asyncio.to_thread(self.monitor.step)
-        finally:
-            self.stepping.set()
+        await asyncio.to_thread(self.monitor.step)
         seen = self.monitor.last_look
         if locked and before is State.AWAY and self.monitor.state is State.PRESENT and seen and seen.faces:
             log.info("someone came back: waking the screen")
@@ -351,20 +370,22 @@ class Daemon:
         try:
             await self.tick()
         except Exception as error:
-            self.failures += 1
+            now = self.clock()
+            if self.failing_since is None:
+                self.failing_since = now
             summary = f"{type(error).__name__}: {error}"
             if summary != self.last_error:
                 log.exception("sensing failed; carrying on")
                 self.last_error = summary
             else:
                 log.debug("sensing failed again: %s", summary)
-            if self.failures >= MAX_FAILURES:
+            if now - self.failing_since >= FAILING_FOR_S:
                 # not getting better by itself: exit, and let systemd start afresh
-                log.error("sensing failed %d times in a row; exiting", self.failures)
+                log.error("sensing has failed for %g s; exiting", now - self.failing_since)
                 self.exit_code = 1
                 self.stop.set()
         else:
-            self.failures = 0
+            self.failing_since = None
             self.last_error = None
 
     async def run(self):
@@ -385,7 +406,7 @@ class Daemon:
         reply = await session.request_name(BUS_NAME, NameFlag.DO_NOT_QUEUE)
         if reply != RequestNameReply.PRIMARY_OWNER:
             log.error("%s is already taken: is presenced running?", BUS_NAME)
-            return 1
+            return EXIT_TAKEN
 
         log.info("presenced %s", __version__)
         speaker, microphone = self.monitor.sonar.nodes()
@@ -395,7 +416,7 @@ class Daemon:
         actions = asyncio.ensure_future(self.run_actions())
         for bus, name in ((session, "session"), (system, "system")):
             asyncio.ensure_future(bus.wait_for_disconnect()).add_done_callback(
-                lambda _, name=name: self.lost_bus(name)
+                lambda done, name=name: self.lost_bus(name, done)
             )
         interval = self.config.sensing.interval
         while not self.stop.is_set():
@@ -411,11 +432,14 @@ class Daemon:
         self.stopping = True
         actions.cancel()
         await asyncio.gather(actions, return_exceptions=True)  # kills a running action
+        await asyncio.sleep(0.1)  # let pause and inhibit replies still waiting go out
         session.disconnect()
         system.disconnect()
         return self.exit_code
 
-    def lost_bus(self, name):
+    def lost_bus(self, name, done=None):
+        if done is not None and not done.cancelled():
+            done.exception()  # retrieved, so asyncio does not complain it never was
         if getattr(self, "stopping", False):
             return
         # every call would fail from now on: exit, and let systemd reconnect us
@@ -466,7 +490,7 @@ def main():
         daemon = Daemon(config)
     except (ConfigError, LookupError, FileNotFoundError) as error:
         log.error("%s", error)
-        return 2
+        return EXIT_CONFIG
     return asyncio.run(daemon.run())
 
 

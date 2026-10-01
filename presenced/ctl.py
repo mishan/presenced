@@ -35,6 +35,9 @@ BusName={bus_name}
 ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5
+# a bad configuration (2) or another presenced already running (3) will not
+# get better by restarting
+RestartPreventExitStatus=2 3
 
 [Install]
 WantedBy=graphical-session.target

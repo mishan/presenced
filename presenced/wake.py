@@ -14,6 +14,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import signal
 import struct
 import time
 
@@ -68,11 +69,15 @@ class Waker:
     async def wake(self):
         """Wake the screen; whether that worked."""
         if self.command:
-            process = await asyncio.create_subprocess_shell(self.command)
+            # its own process group, so a timeout takes whatever the shell started too
+            process = await asyncio.create_subprocess_shell(self.command, start_new_session=True)
             try:
                 return await asyncio.wait_for(process.wait(), COMMAND_TIMEOUT_S) == 0
             except TimeoutError:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 await process.wait()
                 log.warning("wake command still running after %g s, killed", COMMAND_TIMEOUT_S)
                 return False
