@@ -23,6 +23,7 @@ class Sensing:
     quiet_for: float = 30.0  # seconds the sonar must stay quiet before the camera is asked
     recheck_after: float = 10.0  # seconds between the two empty looks that mean away
     interval: float = 3.0  # seconds between sonar probes
+    respect_idle_inhibitors: bool = True  # while a video plays, don't count anyone as away
 
 
 @dataclass
@@ -114,6 +115,10 @@ quiet_for = {sensing.quiet_for:g}
 recheck_after = {sensing.recheck_after:g}
 # Seconds between sonar probes.
 interval = {sensing.interval:g}
+# While a program has asked the desktop not to go idle, as browsers and video
+# players do during playback, sense nothing and count you as present. Your
+# desktop itself would not blank or lock the screen then either.
+respect_idle_inhibitors = {idle_inhibitors}
 
 [sonar]
 enabled = {sonar_enabled}
@@ -156,6 +161,7 @@ def render(config):
         sonar=config.sonar,
         camera=config.camera,
         actions=config.actions,
+        idle_inhibitors=str(config.sensing.respect_idle_inhibitors).lower(),
         sonar_enabled=str(config.sonar.enabled).lower(),
         camera_enabled=str(config.camera.enabled).lower(),
         wake_enabled=str(config.wake.enabled).lower(),

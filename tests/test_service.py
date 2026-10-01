@@ -31,9 +31,13 @@ class FakeMonitor:
 
 
 class FakeDesktop:
-    def __init__(self, locked=True, idle=600.0):
+    def __init__(self, locked=True, idle=600.0, inhibited=False):
         self.is_locked = locked
         self.idle = idle
+        self.inhibited = inhibited
+
+    async def idle_inhibited(self):
+        return self.inhibited
 
     async def locked(self):
         return self.is_locked
@@ -132,4 +136,30 @@ def test_unlocking_counts_as_present():
     monitor.next_state = State.AWAY
     tick(d)
     assert monitor.state is State.AWAY  # stepped after the unlock made it present
+    assert monitor.steps == 1
+
+
+def test_a_playing_video_holds_off_sensing():
+    d, monitor, waker = daemon(locked=False)
+    d.desktop.inhibited = True
+    tick(d)
+    assert monitor.steps == 0
+    assert monitor.state is State.PRESENT
+    assert d.mode == "held"
+
+
+def test_a_video_behind_the_lock_screen_does_not_stop_watching():
+    d, monitor, waker = daemon(locked=True)
+    d.desktop.inhibited = True
+    monitor.next_state, monitor.next_look = State.PRESENT, FACE
+    tick(d)
+    assert monitor.steps == 1
+    assert waker.wakes == 1
+
+
+def test_idle_inhibitors_can_be_ignored():
+    d, monitor, waker = daemon(locked=False)
+    d.config.sensing.respect_idle_inhibitors = False
+    d.desktop.inhibited = True
+    tick(d)
     assert monitor.steps == 1

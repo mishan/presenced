@@ -1,4 +1,5 @@
-"""What the desktop knows: how long since the last input, and whether the screen is locked."""
+"""What the desktop knows: time since the last input, whether the screen is locked,
+and whether a program has asked it not to go idle."""
 import logging
 import os
 
@@ -15,6 +16,8 @@ IDLE_SOURCES = [
 ]
 
 LOGIND = "org.freedesktop.login1"
+
+GNOME_INHIBIT_IDLE = 8  # the "don't go idle" flag of GNOME's session manager inhibitors
 
 
 async def call(bus, destination, path, interface, member, signature="", body=()):
@@ -90,3 +93,16 @@ class Desktop:
         )
         return bool(hint)
 
+
+    async def idle_inhibited(self):
+        """Whether a program asked the desktop not to go idle, as video players do."""
+        body = await call(
+            self.session_bus, "org.gnome.SessionManager", "/org/gnome/SessionManager",
+            "org.gnome.SessionManager", "IsInhibited", "u", (GNOME_INHIBIT_IDLE,),
+        )
+        if body is None:
+            body = await call(
+                self.session_bus, "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement/Inhibit",
+                "org.freedesktop.PowerManagement.Inhibit", "HasInhibit",
+            )
+        return bool(body and body[0])

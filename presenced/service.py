@@ -240,6 +240,12 @@ class Daemon:
             self.monitor.active()  # unlocking proves someone is here
         self.was_locked = locked
 
+        if not locked and self.config.sensing.respect_idle_inhibitors and await self.desktop.idle_inhibited():
+            # a video is playing, say: the desktop will not blank or lock, and neither should we
+            self.set_mode("held")
+            self.monitor.active()
+            return
+
         self.idle_seconds = await self.desktop.idle_seconds()
         if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
             self.set_mode("input")

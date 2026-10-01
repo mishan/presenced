@@ -13,7 +13,9 @@ from other laptops are very welcome.
 
 - **Input first.** While you are typing or moving the mouse you are obviously
   there, so nothing else runs. Sensing starts after a few seconds without
-  input.
+  input. Likewise, while a browser or video player has asked the desktop not
+  to go idle (during playback), you count as present, just as the desktop
+  itself will not blank or lock the screen then.
 - **Sonar.** Every few seconds the speaker plays a short, inaudible 20 kHz
   tone and the microphones record it. In an empty room the returned tone holds
   still; a person in front of the laptop makes it wander. This is cheap, but it
@@ -128,7 +130,7 @@ object `/io/github/mishan/Presenced` and the interface
 |---|---|---|
 | `State` | property `s` | `present` or `away` |
 | `StateSince` | property `d` | Unix time of the last change |
-| `Sensing` | property `s` | `input`, `sensing`, `watching` (sensing while locked), `locked`, `paused` or `inhibited` |
+| `Sensing` | property `s` | `input`, `sensing`, `watching` (sensing while locked), `held` (a program asked the desktop not to go idle), `locked`, `paused` or `inhibited` |
 | `Paused` | property `b` | |
 | `PausedUntil` | property `d` | Unix time, or 0 when not paused or paused until resumed |
 | `Inhibitors` | property `a(uss)` | cookie, who, why |
