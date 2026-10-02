@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from presenced import ir
+from presenced.sensor import Verdict
 
 LISTING = """ioctl: VIDIOC_ENUM_FMT
 \t[0]: 'GREY' (8-bit Greyscale)
@@ -129,3 +130,17 @@ def test_a_corrupt_model_falls_back_to_sonar_alone(monkeypatch):
 
     monkeypatch.setattr(service, "IRCamera", corrupt)
     assert service.make_camera(Camera()) is None
+
+
+@pytest.mark.parametrize(
+    "seen, verdict",
+    [
+        (ir.IRReading(1, 0.9, 20.0, False), Verdict.PRESENT),
+        (ir.IRReading(0, 0.4, 20.0, False), Verdict.ABSENT),
+        (ir.IRReading(0, 0.0, 0.0, True), Verdict.UNKNOWN),
+    ],
+)
+def test_a_face_is_presence_and_a_blind_camera_cannot_tell(seen, verdict):
+    cam = ir.IRCamera.__new__(ir.IRCamera)
+    cam.look = lambda: seen
+    assert cam.read().verdict is verdict

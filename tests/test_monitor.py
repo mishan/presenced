@@ -1,3 +1,5 @@
+import pytest
+
 from presenced.monitor import Monitor, State
 from presenced.sensor import Reading, Verdict
 
@@ -264,3 +266,56 @@ def test_a_face_overruling_a_poll_sensor_is_not_watched_constantly():
     run_for(fake, mon, 300)
     assert mon.state is State.PRESENT
     assert fake.looks <= 300 / 30 + 1
+
+
+@pytest.mark.parametrize(
+    "seen, verdict",
+    [
+        ((FACE, EMPTY), Verdict.PRESENT),
+        ((EMPTY, FACE), Verdict.PRESENT),
+        ((BLIND, EMPTY), Verdict.ABSENT),
+        ((BLIND, BLIND), Verdict.UNKNOWN),
+        ((), Verdict.UNKNOWN),
+    ],
+)
+def test_any_face_wins_and_any_clear_look_beats_a_blind_one(seen, verdict):
+    looks = [Sensor(f"look{i}", "look", lambda r=r: r) for i, r in enumerate(seen)]
+    mon = Monitor(looks, 30.0, 10.0)
+    assert mon.look().verdict is verdict
+
+
+def test_a_hold_between_look_sensors_stops_the_rest():
+    fake, _ = monitor()
+
+    def look_then_pause():
+        mon.freeze()
+        return EMPTY
+
+    mon = Monitor([Sensor("first", "look", look_then_pause), fake.camera], 30.0, 10.0, clock=fake.clock)
+    mon.look()
+    assert fake.looks == 0
+
+
+def test_a_blind_camera_and_a_poll_sensor_saying_nobody_is_here_go_away():
+    # the shutter is closed, then the presence sensor sees the user get up
+    fake, _ = monitor()
+    fake.reading = QUIET
+    fake.seen = BLIND
+    proximity = Sensor("proximity", "poll", lambda: QUIET)
+    mon = Monitor([fake.sonar, proximity, fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 36)
+    assert mon.state is State.PRESENT
+    proximity.read = lambda: GONE
+    assert run_for(fake, mon, 6) is not None
+    assert mon.state is State.AWAY
+
+
+def test_a_poll_sensor_saying_nobody_is_here_does_not_look_while_away():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    mon = Monitor([gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 30)
+    assert mon.state is State.AWAY
+    looks = fake.looks
+    run_for(fake, mon, 120)
+    assert fake.looks == looks

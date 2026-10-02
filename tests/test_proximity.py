@@ -50,3 +50,18 @@ def test_a_laptop_without_one_runs_without_it(tmp_path, monkeypatch):
     device(tmp_path, 0, "als", in_illuminance_raw=300)
     monkeypatch.setattr(proximity, "IIO", tmp_path)
     assert make_proximity(Proximity()) is None
+
+
+def test_only_enabled_and_present_sensors_are_run(tmp_path, monkeypatch):
+    from presenced import proximity
+    from presenced.config import Config
+    from presenced.service import make_sensors
+
+    monkeypatch.setattr(proximity, "IIO", tmp_path)
+    config = Config()
+    config.camera.enabled = False
+    config.proximity.device = "iio:device7"  # configured, but not there
+    assert [sensor.name for sensor in make_sensors(config)] == ["sonar"]
+    device(tmp_path, 7, "prox", in_proximity0_raw=1)
+    config.sonar.enabled = False
+    assert [sensor.name for sensor in make_sensors(config)] == ["proximity"]
