@@ -7,21 +7,26 @@ from dbus_fast import MessageType
 from dbus_fast.errors import DBusError
 
 from presenced.config import Config
-from presenced.ir import IRReading
 from presenced.monitor import State
+from presenced.sensor import Reading, Verdict
 from presenced.service import OBJECT_PATH, Daemon, PresenceInterface
 
-FACE = IRReading(1, 0.9, 20.0, False)
+FACE = Reading(Verdict.PRESENT)
 
 
-class FakeCamera:
-    device = "fake"
-
-    def __init__(self):
+class FakeSensor:
+    def __init__(self, name, role):
+        self.name, self.role = name, role
         self.abort = threading.Event()
-        self.idle = threading.Event()
-        self.idle.set()
-        self.gate = threading.Lock()
+
+    def hold(self):
+        self.abort.set()
+
+    def release(self):
+        self.abort.clear()
+
+    def describe(self):
+        return "fake"
 
 
 class FakeMonitor:
@@ -32,10 +37,11 @@ class FakeMonitor:
         self.next_state = State.AWAY
         self.next_look = None
         self.last_look = None
-        self.last_sonar = None
-        self.sonar = type("Sonar", (), {"found": ("sink", "source"), "speaker": "speaker", "microphone": "mic"})()
-        self.sonar.abort = threading.Event()
-        self.camera = FakeCamera()
+        self.quiet_seconds = 0.0
+        self.readings = {}
+        self.sonar = FakeSensor("sonar", "poll")
+        self.camera = FakeSensor("camera", "look")
+        self.sensors = [self.sonar, self.camera]
         self.hold = threading.Event()
         self.on_change = None
         self.steps = 0
@@ -447,3 +453,36 @@ def test_the_service_unit_does_not_restart_on_permanent_errors():
     assert f"RestartPreventExitStatus={EXIT_CONFIG} {EXIT_TAKEN}" in UNIT
     with open("contrib/presenced.service") as unit:
         assert f"RestartPreventExitStatus={EXIT_CONFIG} {EXIT_TAKEN}" in unit.read()
+
+
+
+def test_status_shows_each_sensor(monkeypatch, capsys):
+    import time
+
+    import numpy as np
+    from dbus_fast import Message, Variant
+
+    from presenced import ctl
+
+    d, monitor, waker = daemon()
+    monitor.readings["sonar"] = Reading(Verdict.QUIET, {"level_db": np.float64(-24.0), "usable": True})
+    Message(destination="a.b", path="/a", member="c", signature="a{sv}", body=[d.status()])._marshall(False)
+
+    class FakeClient(ctl.Client):
+        async def call(self, member, *args):
+            if member == "GetStatus":
+                return (d.status(),)
+            return ({
+                "State": Variant("s", "away"), "StateSince": Variant("d", time.time()),
+                "Sensing": Variant("s", "sensing"), "Paused": Variant("b", False),
+                "PausedUntil": Variant("d", 0.0), "Inhibitors": Variant("a(uss)", []),
+            },)
+
+    async def connect(cls):
+        return FakeClient(type("Bus", (), {"disconnect": lambda self: None})())
+
+    monkeypatch.setattr(ctl.Client, "connect", classmethod(connect))
+    asyncio.run(ctl.cmd_status(None))
+    out = capsys.readouterr().out
+    assert "Sonar:    quiet (level_db -24.0, usable True), fake\n" in out
+    assert "Camera:   not read yet, fake\n" in out

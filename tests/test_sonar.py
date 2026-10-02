@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 
-from presenced.sonar import CHANNELS, RATE, analyze
+from presenced.sensor import Verdict
+from presenced.sonar import CHANNELS, RATE, UNUSABLE, Sonar, SonarReading, analyze
 
 TONE_HZ = 20000.0
 
@@ -193,3 +195,17 @@ def test_a_hold_cuts_a_playing_tone_short(monkeypatch):
     started = time.monotonic()
     assert player.play(sonar.make_tone(20000.0, 5.0), sink="speaker") is False
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize(
+    "reading, verdict",
+    [
+        (SonarReading(-24.0, -15.0), Verdict.PRESENT),
+        (SonarReading(-24.0, -33.0), Verdict.QUIET),
+        (UNUSABLE, Verdict.UNKNOWN),
+    ],
+)
+def test_motion_above_the_threshold_is_presence(monkeypatch, reading, verdict):
+    sonar = Sonar(threshold_db=-28.0)
+    monkeypatch.setattr(sonar, "probe", lambda: reading)
+    assert sonar.read().verdict is verdict

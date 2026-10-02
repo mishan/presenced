@@ -1,19 +1,23 @@
-"""Decide between present and away from the sonar and the camera.
+"""Decide between present and away from what the sensors say.
 
-Sonar is the cheap, frequent check. It only sees motion, and a person can hold
-still for a while, so a single quiet reading means nothing: the sonar has to
-stay quiet for a sustained period before the IR camera is asked whether a face
-is still there, and the camera has to miss twice, some time apart, before the
-user counts as away.
+Poll sensors (the sonar) are the cheap, frequent check. The sonar only sees
+motion, and a person can hold still for a while, so a single quiet reading
+means nothing: the poll sensors have to stay quiet for a sustained period
+before the look sensors (the IR camera) are asked whether a face is still
+there, and they have to miss twice, some time apart, before the user counts as
+away.
 """
 import enum
 import logging
 import threading
 import time
 
+from .sensor import Reading, Verdict
+
 log = logging.getLogger("presenced")
 
-BLIND_PATIENCE = 3  # with the camera blind, wait this many times longer on sonar alone
+BLIND_PATIENCE = 3  # with the look sensors blind, wait this many times longer on the poll sensors alone
+BLIND = Reading(Verdict.UNKNOWN)
 
 
 class State(enum.Enum):
@@ -22,19 +26,10 @@ class State(enum.Enum):
 
 
 class Monitor:
-    def __init__(
-        self,
-        sonar,
-        camera,
-        threshold_db,
-        quiet_for,
-        recheck_after,
-        on_change=None,
-        clock=time.monotonic,
-    ):
-        self.sonar = sonar
-        self.camera = camera
-        self.threshold_db = threshold_db
+    def __init__(self, sensors, quiet_for, recheck_after, on_change=None, clock=time.monotonic):
+        self.sensors = sensors
+        self.polls = [sensor for sensor in sensors if sensor.role == "poll"]
+        self.looks = [sensor for sensor in sensors if sensor.role == "look"]
         self.quiet_for = quiet_for
         self.recheck_after = recheck_after
         self.on_change = on_change
@@ -43,8 +38,9 @@ class Monitor:
         self.quiet_since = None  # start of the current unbroken run of quiet probes
         self.missed_at = None  # when the camera last came up empty in this run
         self.looked_at = None  # when the camera was last asked, while away
-        self.blind_at = None  # when the camera last saw nothing at all
-        self.last_sonar = None
+        self.blind_at = None  # when the look sensors last saw nothing at all
+        self.seen_at = None  # when a look last found someone in this run
+        self.readings = {}  # the latest reading of each sensor, by name
         self.last_look = None
         # while set, the state is frozen: a step already under way when sensing
         # was paused or inhibited must not switch it, or run an action. The
@@ -70,6 +66,7 @@ class Monitor:
             self.missed_at = None
             self.looked_at = None
             self.blind_at = None
+            self.seen_at = None
             log.info("now %s", state.value)
             if self.on_change:
                 self.on_change(state)
@@ -85,79 +82,98 @@ class Monitor:
         self.missed_at = None
         self.looked_at = None
         self.blind_at = None
+        self.seen_at = None
+
+    def read(self, sensor):
+        reading = sensor.read()
+        self.readings[sensor.name] = reading
+        log.debug(
+            "%s: %s %s", sensor.name, reading.verdict.value,
+            " ".join(f"{key}={value:.1f}" if isinstance(value, float) else f"{key}={value}"
+                     for key, value in reading.detail.items()),
+        )
+        return reading.verdict
 
     def look(self):
-        seen = self.camera.look()  # returns at once, blind, if held meanwhile
-        self.last_look = seen
-        log.debug(
-            "camera: faces=%d score=%.2f near=%.0f%% blind=%s",
-            seen.faces, seen.score, seen.near_pct, seen.blind,
-        )
-        return seen
+        """PRESENT if any look sensor sees someone, ABSENT if any sees nobody, else UNKNOWN."""
+        verdicts = set()
+        for sensor in self.looks:
+            if self.hold.is_set():
+                break
+            verdicts.add(self.read(sensor))  # returns at once, UNKNOWN, if held meanwhile
+        for verdict in (Verdict.PRESENT, Verdict.ABSENT):
+            if verdict in verdicts:
+                self.last_look = Reading(verdict)
+                return self.last_look
+        self.last_look = BLIND
+        return BLIND
 
     def step(self):
         if self.hold.is_set():
             return
         now = self.clock()
-        reading = self.sonar.probe()
-        if self.hold.is_set():
-            return  # paused or inhibited during the probe: leave the camera alone
-        self.last_sonar = reading
-        moving = reading.usable and reading.motion_db > self.threshold_db
+        verdicts = set()
+        for sensor in self.polls:
+            verdicts.add(self.read(sensor))
+            if self.hold.is_set():
+                return  # paused or inhibited during the read: leave the look sensors alone
+        moving = Verdict.PRESENT in verdicts
+        # someone moving at the laptop is there, whatever else says they left
+        absent = not moving and Verdict.ABSENT in verdicts
+        usable = bool(verdicts - {Verdict.UNKNOWN})
         if moving:
             self.quiet_since = None
             self.missed_at = None
+            self.seen_at = None
         elif self.quiet_since is None:
             self.quiet_since = now
         quiet_s = 0.0 if self.quiet_since is None else now - self.quiet_since
-        log.debug(
-            "sonar: level=%.1f dB motion=%.1f dB %s",
-            reading.level_db, reading.motion_db,
-            "moving" if moving else f"quiet {quiet_s:.0f} s" if reading.usable else "unusable",
-        )
         if self.state is State.PRESENT:
-            self.step_present(now, quiet_s, reading.usable)
+            self.step_present(now, quiet_s, usable, absent)
         else:
-            self.step_away(now, quiet_s, moving, reading.usable)
+            self.step_away(now, quiet_s, moving, usable)
 
-    def step_present(self, now, quiet_s, sonar_usable):
-        if quiet_s < self.quiet_for:
+    def step_present(self, now, quiet_s, usable, absent):
+        # a poll sensor that says nobody is here skips the wait, unless a look
+        # has since found someone: then it is someone sitting still, as with the sonar
+        if quiet_s < self.quiet_for and (not absent or self.seen_at is not None):
             return
-        sonar_says_away = sonar_usable and quiet_s >= BLIND_PATIENCE * self.quiet_for
+        polls_say_away = absent or (usable and quiet_s >= BLIND_PATIENCE * self.quiet_for)
         if self.blind_at is not None and now - self.blind_at < self.quiet_for:
             # the camera was blind a moment ago (shutter closed?): rely on the
-            # sonar for now rather than blink the camera every probe
-            if sonar_says_away:
+            # poll sensors for now rather than blink the camera every probe
+            if polls_say_away:
                 self.switch(State.AWAY)
             return
         if self.missed_at is not None and now - self.missed_at < self.recheck_after:
             return
-        seen = self.look()
-        if seen.blind:
+        seen = self.look().verdict
+        if seen is Verdict.UNKNOWN:
             self.blind_at = now
-            if sonar_says_away:
+            if polls_say_away:
                 self.switch(State.AWAY)
             return
         self.blind_at = None
-        if seen.faces:
+        if seen is Verdict.PRESENT:
             # sitting still: wait out another full quiet period before looking again
             self.quiet_since = now
             self.missed_at = None
+            self.seen_at = now
         elif self.missed_at is None:
             self.missed_at = now
         else:
             self.switch(State.AWAY)
 
-    def step_away(self, now, quiet_s, moving, sonar_usable):
+    def step_away(self, now, quiet_s, moving, usable):
         if moving:
             # people walking past should not blink the camera every probe
             if self.looked_at is not None and now - self.looked_at < self.recheck_after:
                 return
-        elif sonar_usable or quiet_s < self.quiet_for:
+        elif usable or quiet_s < self.quiet_for:
             return
         self.looked_at = now
         if not moving:
-            self.quiet_since = now  # without sonar, look again after another quiet period
-        seen = self.look()
-        if seen.faces or (seen.blind and moving):
+            self.quiet_since = now  # without poll sensors, look again after another quiet period
+        seen = self.look().verdict
+        if seen is Verdict.PRESENT or (seen is Verdict.UNKNOWN and moving):
             self.switch(State.PRESENT)

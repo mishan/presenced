@@ -22,9 +22,10 @@ from . import __version__
 from .config import ConfigError, load
 from .controls import Controls
 from .desktop import Desktop, call
-from .ir import IRCamera, NoCamera
+from .ir import IRCamera
 from .monitor import Monitor, State
-from .sonar import NoSonar, Sonar
+from .sensor import Verdict
+from .sonar import Sonar
 from .wake import Waker
 
 log = logging.getLogger("presenced")
@@ -133,11 +134,7 @@ class Daemon:
         self.exit_code = 0
         self.clock = time.monotonic
         self.monitor = monitor or Monitor(
-            make_sonar(config.sonar),
-            make_camera(config.camera),
-            config.sonar.threshold_db,
-            config.sensing.quiet_for,
-            config.sensing.recheck_after,
+            make_sensors(config), config.sensing.quiet_for, config.sensing.recheck_after
         )
         self.monitor.on_change = self.state_changed
         self.waker = waker or Waker(config.wake.command)
@@ -210,10 +207,8 @@ class Daemon:
     def hold_now(self):
         """Freeze the state at once, and stop a check under way from using the speaker or camera."""
         self.monitor.freeze()
-        self.monitor.sonar.abort.set()
-        camera = self.monitor.camera
-        with camera.gate:
-            camera.abort.set()
+        for sensor in self.monitor.sensors:
+            sensor.hold()
 
     async def step_finished(self, result=None):
         """result, once no check is under way any more."""
@@ -239,8 +234,8 @@ class Daemon:
             return False
         if self.monitor.hold.is_set():
             self.monitor.hold.clear()
-            self.monitor.sonar.abort.clear()
-            self.monitor.camera.abort.clear()
+            for sensor in self.monitor.sensors:
+                sensor.release()
             self.monitor.restart()  # whatever was counted before the hold is stale now
         return True
 
@@ -275,20 +270,14 @@ class Daemon:
             "state": Variant("s", monitor.state.value),
             "sensing": Variant("s", self.mode),
             "quiet_seconds": Variant("d", monitor.quiet_seconds),
-            "speaker": Variant("s", monitor.sonar.found[0] or f"{monitor.sonar.speaker} (not found)"),
-            "microphone": Variant("s", monitor.sonar.found[1] or f"{monitor.sonar.microphone} (not found)"),
-            "camera": Variant("s", monitor.camera.device),
+            "sensors": Variant("a{sv}", {
+                sensor.name: Variant("a{sv}", sensor_status(sensor, monitor.readings.get(sensor.name)))
+                for sensor in monitor.sensors
+            }),
             "version": Variant("s", __version__),
         }
         if self.idle_seconds is not None:
             status["idle_seconds"] = Variant("d", self.idle_seconds)
-        if monitor.last_sonar is not None:
-            status["sonar_level_db"] = Variant("d", monitor.last_sonar.level_db)
-            status["sonar_motion_db"] = Variant("d", monitor.last_sonar.motion_db)
-            status["sonar_usable"] = Variant("b", monitor.last_sonar.usable)
-        if monitor.last_look is not None:
-            status["face_score"] = Variant("d", monitor.last_look.score)
-            status["camera_blind"] = Variant("b", monitor.last_look.blind)
         if self.last_error:
             status["last_error"] = Variant("s", self.last_error)
         return status
@@ -361,7 +350,10 @@ class Daemon:
         before = self.monitor.state
         await asyncio.to_thread(self.monitor.step)
         seen = self.monitor.last_look
-        if locked and before is State.AWAY and self.monitor.state is State.PRESENT and seen and seen.faces:
+        if (
+            locked and before is State.AWAY and self.monitor.state is State.PRESENT
+            and seen and seen.verdict is Verdict.PRESENT
+        ):
             log.info("someone came back: waking the screen")
             await self.waker.wake()
 
@@ -409,10 +401,10 @@ class Daemon:
             return EXIT_TAKEN
 
         log.info("presenced %s", __version__)
-        speaker, microphone = self.monitor.sonar.nodes()
-        log.info("speaker %s", speaker or f"{self.monitor.sonar.speaker!r} not found")
-        log.info("microphone %s", microphone or f"{self.monitor.sonar.microphone!r} not found")
-        log.info("camera %s", self.monitor.camera.device)
+        for sensor in self.monitor.sensors:
+            log.info("%s: %s", sensor.name, sensor.describe())
+        if not self.monitor.sensors:
+            log.warning("no sensors: only input and unlocking count")
         actions = asyncio.ensure_future(self.run_actions())
         for bus, name in ((session, "session"), (system, "system")):
             asyncio.ensure_future(bus.wait_for_disconnect()).add_done_callback(
@@ -448,21 +440,36 @@ class Daemon:
         self.stop.set()
 
 
+def make_sensors(config):
+    return [sensor for sensor in (make_sonar(config.sonar), make_camera(config.camera)) if sensor]
+
+
 def make_sonar(config):
     if not config.enabled:
-        return NoSonar()
-    return Sonar(config.tone_hz, config.burst, config.speaker, config.microphone)
+        return None
+    return Sonar(config.tone_hz, config.burst, config.speaker, config.microphone, config.threshold_db)
 
 
 def make_camera(config):
-    """The IR camera, or a stand-in if it is turned off or cannot be used."""
+    """The IR camera, or None if it is turned off or cannot be used."""
     if not config.enabled:
-        return NoCamera()
+        return None
     try:
         return IRCamera(config.device, config.score_threshold, config.min_face_width)
     except (LookupError, FileNotFoundError, OSError, subprocess.SubprocessError, cv2.error) as error:
-        log.warning("no camera, sensing with the sonar alone: %s", error)
-        return NoCamera()
+        log.warning("no camera: %s", error)
+        return None
+
+
+def sensor_status(sensor, reading):
+    """A sensor's latest verdict and numbers, as D-Bus variants."""
+    values = {"device": sensor.describe()}
+    if reading is not None:
+        values = {**values, "verdict": reading.verdict.value, **reading.detail}
+    def signature(value):  # bool before int, since a bool is an int
+        return next(sig for kind, sig in ((bool, "b"), (int, "i"), (float, "d"), (str, "s")) if isinstance(value, kind))
+
+    return {key: Variant(signature(value), value) for key, value in values.items()}
 
 
 def kill_group(process):

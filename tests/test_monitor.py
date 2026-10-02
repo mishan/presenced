@@ -1,14 +1,19 @@
-from presenced.ir import IRReading
 from presenced.monitor import Monitor, State
-from presenced.sonar import SonarReading
+from presenced.sensor import Reading, Verdict
 
 INTERVAL = 3.0
-MOVING = SonarReading(-24.0, -15.0)
-QUIET = SonarReading(-24.0, -33.0)
-MUTED = SonarReading(-120.0, 0.0)
-FACE = IRReading(1, 0.9, 20.0, False)
-EMPTY = IRReading(0, 0.0, 20.0, False)
-BLIND = IRReading(0, 0.0, 0.0, True)
+MOVING = Reading(Verdict.PRESENT)
+QUIET = Reading(Verdict.QUIET)
+MUTED = Reading(Verdict.UNKNOWN)
+GONE = Reading(Verdict.ABSENT)
+FACE = Reading(Verdict.PRESENT)
+EMPTY = Reading(Verdict.ABSENT)
+BLIND = Reading(Verdict.UNKNOWN)
+
+
+class Sensor:
+    def __init__(self, name, role, read):
+        self.name, self.role, self.read = name, role, read
 
 
 class Fake:
@@ -19,9 +24,8 @@ class Fake:
         self.reading = MOVING
         self.seen = FACE
         self.looks = 0
-
-    def probe(self):
-        return self.reading
+        self.sonar = Sensor("sonar", "poll", lambda: self.reading)
+        self.camera = Sensor("camera", "look", self.look)
 
     def look(self):
         self.looks += 1
@@ -33,7 +37,7 @@ class Fake:
 
 def monitor():
     fake = Fake()
-    return fake, Monitor(fake, fake, -28.0, 30.0, 10.0, clock=fake.clock)
+    return fake, Monitor([fake.sonar, fake.camera], 30.0, 10.0, clock=fake.clock)
 
 
 def run_for(fake, mon, seconds):
@@ -159,22 +163,18 @@ def test_changes_are_reported_once_each():
 
 
 def test_camera_alone_decides_when_sonar_is_off():
-    from presenced.sonar import NoSonar
-
     fake, _ = monitor()
     fake.seen = EMPTY
-    mon = Monitor(NoSonar(), fake, -28.0, 30.0, 10.0, clock=fake.clock)
+    mon = Monitor([fake.camera], 30.0, 10.0, clock=fake.clock)
     changed_at = run_for(fake, mon, 120)
     assert mon.state is State.AWAY
     assert 40 <= changed_at <= 45
 
 
 def test_sonar_alone_decides_when_camera_is_off():
-    from presenced.ir import NoCamera
-
     fake, _ = monitor()
     fake.reading = QUIET
-    mon = Monitor(fake, NoCamera(), -28.0, 30.0, 10.0, clock=fake.clock)
+    mon = Monitor([fake.sonar], 30.0, 10.0, clock=fake.clock)
     changed_at = run_for(fake, mon, 150)
     assert mon.state is State.AWAY
     assert 90 <= changed_at <= 95
@@ -218,13 +218,49 @@ def test_a_hold_set_during_the_probe_keeps_the_camera_shut():
     fake.seen = EMPTY
     run_for(fake, mon, 30)
     looks = fake.looks
-    original = fake.probe
 
     def probe_then_pause():
         mon.freeze()
-        return original()
+        return fake.reading
 
-    fake.probe = probe_then_pause
+    fake.sonar.read = probe_then_pause
     run_for(fake, mon, 30)
     assert fake.looks == looks
     assert mon.state is State.PRESENT
+
+
+def gone_sensor():
+    return Sensor("proximity", "poll", lambda: GONE)
+
+
+def test_a_poll_sensor_saying_nobody_is_here_skips_the_quiet_wait():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    mon = Monitor([gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    changed_at = run_for(fake, mon, 60)
+    assert mon.state is State.AWAY
+    assert changed_at <= 12
+    assert fake.looks == 2
+
+
+def test_with_nothing_to_look_a_poll_sensor_saying_nobody_is_here_decides_at_once():
+    fake, _ = monitor()
+    mon = Monitor([gone_sensor()], 30.0, 10.0, clock=fake.clock)
+    assert run_for(fake, mon, 6) == 0
+
+
+def test_motion_beats_a_poll_sensor_saying_nobody_is_here():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    mon = Monitor([fake.sonar, gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 120)
+    assert mon.state is State.PRESENT
+    assert fake.looks == 0
+
+
+def test_a_face_overruling_a_poll_sensor_is_not_watched_constantly():
+    fake, _ = monitor()
+    mon = Monitor([gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 300)
+    assert mon.state is State.PRESENT
+    assert fake.looks <= 300 / 30 + 1

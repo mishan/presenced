@@ -135,17 +135,15 @@ async def cmd_status(args):
         print(f"Inhibited by {who}: {why}")
     if "idle_seconds" in status:
         print(f"Input:    idle {ago(status['idle_seconds'])}")
-    if "sonar_level_db" in status:
-        usable = "" if status["sonar_usable"] else " (unusable: muted or no speaker?)"
-        print(
-            f"Sonar:    level {status['sonar_level_db']:.1f} dB, motion {status['sonar_motion_db']:.1f} dB,"
-            f" quiet {ago(status['quiet_seconds'])}{usable}"
+    print(f"Quiet:    {ago(status['quiet_seconds'])}")
+    for name, values in status["sensors"].items():
+        values = {key: variant.value for key, variant in values.value.items()}
+        device = values.pop("device", "")
+        verdict = values.pop("verdict", "not read yet")
+        numbers = ", ".join(
+            f"{key} {value:.1f}" if isinstance(value, float) else f"{key} {value}" for key, value in values.items()
         )
-    if "face_score" in status:
-        print("Camera:   " + ("blind" if status["camera_blind"] else f"last face score {status['face_score']:.2f}"))
-    print(f"Devices:  speaker {status['speaker']}")
-    print(f"          microphone {status['microphone']}")
-    print(f"          camera {status['camera']}")
+        print(f"{name.capitalize() + ':':<10}{verdict}{f' ({numbers})' if numbers else ''}, {device}")
     client.bus.disconnect()
 
 

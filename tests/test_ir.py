@@ -37,7 +37,7 @@ def test_no_ir_camera_falls_back_to_sonar_alone(monkeypatch):
     from presenced.service import make_camera
 
     monkeypatch.setattr(ir.glob, "glob", lambda pattern: [])
-    assert isinstance(make_camera(Camera()), ir.NoCamera)
+    assert make_camera(Camera()) is None
 
 
 def test_a_stalled_camera_does_not_block_forever():
@@ -128,4 +128,4 @@ def test_a_corrupt_model_falls_back_to_sonar_alone(monkeypatch):
         raise cv2.error("failed to parse the model")
 
     monkeypatch.setattr(service, "IRCamera", corrupt)
-    assert isinstance(service.make_camera(Camera()), ir.NoCamera)
+    assert service.make_camera(Camera()) is None
