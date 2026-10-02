@@ -53,7 +53,8 @@ class Monitor:
 
     @property
     def quiet_seconds(self):
-        return 0.0 if self.quiet_since is None else self.clock() - self.quiet_since
+        since = self.quiet_since  # once: a step in the sensing thread may clear it meanwhile
+        return 0.0 if since is None else self.clock() - since
 
     def freeze(self):
         with self.gate:
@@ -196,6 +197,10 @@ class Monitor:
         seen = self.look().verdict
         if seen is Verdict.PRESENT or (seen is Verdict.UNKNOWN and moving):
             self.switch(State.PRESENT)
+            # the switch forgets this run; keep this look, so the next waits its turn
+            self.looked_at = now
+            if seen is Verdict.PRESENT:
+                self.seen_at = now
         elif moving:
             # double the wait up to quiet_for, but never below recheck_after
             self.away_wait = max(self.away_wait, min(2 * self.away_wait, self.quiet_for))

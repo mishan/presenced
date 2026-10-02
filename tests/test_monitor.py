@@ -356,8 +356,8 @@ def test_motion_while_away_never_looks_more_often_than_recheck_after():
     assert fake.looks - looks <= 120 / 60 + 1
 
 
-@pytest.mark.parametrize("seen", [FACE, EMPTY])
-def test_a_flickering_poll_sensor_does_not_blink_the_camera(seen):
+@pytest.mark.parametrize("seen, max_looks", [(FACE, 120 / 30 + 1), (EMPTY, 120 / 10 + 1)])
+def test_a_flickering_poll_sensor_does_not_blink_the_camera(seen, max_looks):
     # someone at the edge of the presence sensor's range: 1, 0, 1, 0...
     fake, _ = monitor()
     fake.seen = seen
@@ -365,4 +365,19 @@ def test_a_flickering_poll_sensor_does_not_blink_the_camera(seen):
     mon = Monitor([Sensor("proximity", "poll", lambda: next(flicker)), fake.camera], 30.0, 10.0, clock=fake.clock)
     run_for(fake, mon, 120)
     assert mon.state is State.PRESENT
-    assert fake.looks <= 120 / 10 + 1
+    assert fake.looks <= max_looks
+
+
+def test_the_look_that_finds_someone_back_counts_toward_the_next():
+    # sitting down at the edge of the presence sensor's range: present, absent...
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    readings = iter([GONE] * 12 + [MOVING, GONE] * 20)
+    mon = Monitor([Sensor("proximity", "poll", lambda: next(readings)), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 36)
+    assert mon.state is State.AWAY
+    fake.seen = FACE
+    looks = fake.looks
+    run_for(fake, mon, 9)
+    assert mon.state is State.PRESENT
+    assert fake.looks - looks == 1
