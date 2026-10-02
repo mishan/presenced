@@ -138,7 +138,8 @@ like the presence sensor's, may simply finish.
 
 ## Deciding
 
-These rules give exactly today's behavior with the sonar and camera.
+With the sonar and camera alone these rules decide as presenced always has,
+except that looks for lasting motion while away back off (below).
 
 While **present**:
 
@@ -147,8 +148,10 @@ While **present**:
   look sensors are read. Any `PRESENT` restarts the count; `ABSENT` twice,
   `recheck_after` apart, means away.
 - A poll sensor `ABSENT` skips the rest of the quiet wait and goes straight to
-  the looks. Only if no look sensor can see does it mean away on its own, and
-  then only once it has lasted `recheck_after`.
+  the looks, but no sooner than `recheck_after` after the last look, nor
+  `quiet_for` after one that found someone anyway, so a sensor that flickers
+  does not blink the camera. Only if no look sensor can see does it mean away
+  on its own, and then only once it has lasted `recheck_after`.
 - `PRESENT` beats `ABSENT`. When the phone has left but someone is moving at
   the laptop, someone is there. presenced is a convenience, not a security
   boundary, and erring toward present is the safe failure.
@@ -160,7 +163,7 @@ While **away**:
 - A poll sensor `PRESENT` asks for a look, no more than once per
   `recheck_after`, so people walking past do not blink the camera every tick.
   While it lasts and the looks keep missing, the wait doubles, up to
-  `quiet_for`, so a sensor that keeps seeing someone the camera does not
+  `quiet_for` (never below `recheck_after`), so a sensor that keeps seeing someone the camera does not
   (beside the desk, say) does not blink it forever.
 - A look `PRESENT` means present. With no look sensor able to see, a poll
   sensor `PRESENT` is enough.

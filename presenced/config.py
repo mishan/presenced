@@ -168,7 +168,8 @@ min_face_width = {camera.min_face_width:g}
 # The laptop's own human presence sensor, if it has one that Linux exposes
 # (hid-sensor-prox). It sees someone sitting still, so the camera rarely needs to.
 enabled = {proximity_enabled}
-# Empty: the first IIO device named prox. Or iio:deviceN, or its path in /sys.
+# Empty (best): the first IIO device named prox. iio:deviceN or its path in
+# /sys work too, but the N can change between boots.
 device = {proximity_device}
 
 [wake]

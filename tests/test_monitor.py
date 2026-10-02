@@ -341,3 +341,28 @@ def test_a_poll_sensor_that_keeps_seeing_someone_the_camera_does_not_backs_off()
     seeing.read = lambda: MOVING  # someone beside the desk, say
     run_for(fake, mon, 300)
     assert fake.looks - looks <= 300 / 30 + 2
+
+
+def test_motion_while_away_never_looks_more_often_than_recheck_after():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    fake.reading = QUIET
+    mon = Monitor([fake.sonar, fake.camera], 5.0, 60.0, clock=fake.clock)
+    run_for(fake, mon, 120)
+    assert mon.state is State.AWAY
+    looks = fake.looks
+    fake.reading = MOVING
+    run_for(fake, mon, 120)
+    assert fake.looks - looks <= 120 / 60 + 1
+
+
+@pytest.mark.parametrize("seen", [FACE, EMPTY])
+def test_a_flickering_poll_sensor_does_not_blink_the_camera(seen):
+    # someone at the edge of the presence sensor's range: 1, 0, 1, 0...
+    fake, _ = monitor()
+    fake.seen = seen
+    flicker = iter([MOVING, GONE] * 100)
+    mon = Monitor([Sensor("proximity", "poll", lambda: next(flicker)), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 120)
+    assert mon.state is State.PRESENT
+    assert fake.looks <= 120 / 10 + 1

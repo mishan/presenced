@@ -37,11 +37,11 @@ class Monitor:
         self.state = State.PRESENT
         self.quiet_since = None  # start of the current unbroken run of quiet probes
         self.missed_at = None  # when the camera last came up empty in this run
-        self.looked_at = None  # when the camera was last asked, while away
+        self.looked_at = None  # when the look sensors were last asked
         self.blind_at = None  # when the look sensors last saw nothing at all
         self.seen_at = None  # when a look last found someone in this run
         self.absent_since = None  # start of an unbroken run of poll sensors saying nobody is here
-        self.misses = 0  # looks in a row that found nobody while poll sensors said someone, while away
+        self.away_wait = recheck_after  # least time between looks for motion while away; grows with misses
         self.readings = {}  # the latest reading of each sensor, by name
         self.last_look = None
         # while set, the state is frozen: a step already under way when sensing
@@ -82,7 +82,7 @@ class Monitor:
         self.blind_at = None
         self.seen_at = None
         self.absent_since = None
-        self.misses = 0
+        self.away_wait = self.recheck_after
 
     def read(self, sensor):
         reading = sensor.read()
@@ -128,7 +128,6 @@ class Monitor:
         if moving:
             self.quiet_since = None
             self.missed_at = None
-            self.seen_at = None
         elif self.quiet_since is None:
             self.quiet_since = now
         quiet_s = 0.0 if self.quiet_since is None else now - self.quiet_since
@@ -138,10 +137,17 @@ class Monitor:
             self.step_away(now, quiet_s, moving, usable)
 
     def step_present(self, now, quiet_s, usable, absent):
-        # a poll sensor that says nobody is here skips the wait, unless a look
-        # has since found someone: then it is someone sitting still, as with the sonar
-        if quiet_s < self.quiet_for and (not absent or self.seen_at is not None):
-            return
+        if quiet_s < self.quiet_for:
+            # a poll sensor that says nobody is here skips the wait, but one that
+            # flickers (someone at the edge of its range) must not blink the camera:
+            # not within recheck_after of the last look, nor within quiet_for of one
+            # that found someone anyway
+            if not absent:
+                return
+            if self.looked_at is not None and now - self.looked_at < self.recheck_after:
+                return
+            if self.seen_at is not None and now - self.seen_at < self.quiet_for:
+                return
         # with nothing able to look, one absent reading is not enough: a presence
         # sensor that times out reads as nobody there, so it has to persist
         polls_say_away = (absent and now - self.absent_since >= self.recheck_after) or (
@@ -155,6 +161,7 @@ class Monitor:
             return
         if self.missed_at is not None and now - self.missed_at < self.recheck_after:
             return
+        self.looked_at = now
         seen = self.look().verdict
         if seen is Verdict.UNKNOWN:
             self.blind_at = now
@@ -177,11 +184,10 @@ class Monitor:
             # people walking past should not blink the camera every probe, and a
             # poll sensor that keeps seeing someone the camera does not (beside the
             # desk, say) should not blink it forever: back off while that lasts
-            wait = min(self.recheck_after * 2 ** self.misses, self.quiet_for)
-            if self.looked_at is not None and now - self.looked_at < wait:
+            if self.looked_at is not None and now - self.looked_at < self.away_wait:
                 return
         else:
-            self.misses = 0
+            self.away_wait = self.recheck_after
             if usable or quiet_s < self.quiet_for:
                 return
         self.looked_at = now
@@ -191,4 +197,5 @@ class Monitor:
         if seen is Verdict.PRESENT or (seen is Verdict.UNKNOWN and moving):
             self.switch(State.PRESENT)
         elif moving:
-            self.misses += 1
+            # double the wait up to quiet_for, but never below recheck_after
+            self.away_wait = max(self.away_wait, min(2 * self.away_wait, self.quiet_for))
