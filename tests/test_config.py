@@ -30,6 +30,7 @@ def test_wrong_types_are_errors():
 def test_rendered_template_reads_back_the_same():
     config = Config()
     config.sonar.tone_hz = 21500.0
+    config.proximity.device = "iio:device3"
     config.actions.on_away = 'notify-send "gone" && loginctl lock-session'
     assert parse(render(config)) == config
 

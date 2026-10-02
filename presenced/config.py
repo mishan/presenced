@@ -45,6 +45,12 @@ class Camera:
 
 
 @dataclass
+class Proximity:
+    enabled: bool = True
+    device: str = ""  # IIO device, as iio:deviceN or a path; empty: the first one named prox
+
+
+@dataclass
 class Wake:
     enabled: bool = False  # keep sensing while locked, and wake the screen when someone comes
     command: str = ""  # shell command that wakes the screen; empty: a nudge of a virtual mouse
@@ -61,6 +67,7 @@ class Config:
     sensing: Sensing = field(default_factory=Sensing)
     sonar: Sonar = field(default_factory=Sonar)
     camera: Camera = field(default_factory=Camera)
+    proximity: Proximity = field(default_factory=Proximity)
     wake: Wake = field(default_factory=Wake)
     actions: Actions = field(default_factory=Actions)
 
@@ -157,6 +164,13 @@ score_threshold = {camera.score_threshold:g}
 # Faces narrower than this share of the frame are too far away to count.
 min_face_width = {camera.min_face_width:g}
 
+[proximity]
+# The laptop's own human presence sensor, if it has one that Linux exposes
+# (hid-sensor-prox). It sees someone sitting still, so the camera rarely needs to.
+enabled = {proximity_enabled}
+# Empty: the first IIO device named prox. Or iio:deviceN, or its path in /sys.
+device = {proximity_device}
+
 [wake]
 # Keep sensing while the screen is locked, and wake the screen when someone
 # comes to the laptop. The camera LED lights whenever it looks, so this is off
@@ -184,6 +198,8 @@ def render(config):
         idle_inhibitors=str(config.sensing.respect_idle_inhibitors).lower(),
         sonar_enabled=str(config.sonar.enabled).lower(),
         camera_enabled=str(config.camera.enabled).lower(),
+        proximity_enabled=str(config.proximity.enabled).lower(),
+        proximity_device=json.dumps(config.proximity.device),
         wake_enabled=str(config.wake.enabled).lower(),
         wake_command=json.dumps(config.wake.command),
         # JSON strings are valid TOML basic strings, escapes included

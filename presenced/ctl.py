@@ -143,7 +143,7 @@ async def cmd_status(args):
         numbers = ", ".join(
             f"{key} {value:.1f}" if isinstance(value, float) else f"{key} {value}" for key, value in values.items()
         )
-        print(f"{name.capitalize() + ':':<10}{verdict}{f' ({numbers})' if numbers else ''}, {device}")
+        print(f"{name.capitalize() + ':':<9} {verdict}{f' ({numbers})' if numbers else ''}, {device}")
     client.bus.disconnect()
 
 

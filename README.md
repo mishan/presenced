@@ -28,6 +28,14 @@ from other laptops are very welcome.
   decides whether someone is there. The camera's exposure is aimed at the face,
   since a face at arm's length is otherwise washed out.
 
+- **Presence sensor.** Some laptops have a dedicated human presence sensor
+  for Windows to lock on walking away. Where Linux exposes one (as an IIO
+  device named `prox`, through `hid-sensor-prox`), presenced reads it every few
+  seconds alongside the sonar. It sees someone sitting still, so the camera
+  rarely needs to look; when it reports nobody there, the camera looks at once
+  rather than after the quiet period. This is new and untested on real
+  hardware: reports from laptops that have one are especially welcome.
+
 You count as away when the sonar has stayed quiet for `quiet_for` seconds
 (default 30) and the camera then finds no face twice, `recheck_after` seconds
 apart (default 10). Any motion or input in between starts the count again. With

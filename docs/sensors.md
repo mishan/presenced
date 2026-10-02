@@ -1,6 +1,8 @@
 # Sensors: design
 
-Status: proposal. Nothing here is implemented yet.
+Status: the sensor interface, the monitor's rules, per-sensor status and the
+laptop presence sensor (`presenced/proximity.py`) are implemented. `Report`,
+command sensors, Bluetooth and the open questions are still proposals.
 
 presenced knows about two sensors, the sonar and the IR camera, and `Monitor`
 takes them by name. This proposes a common interface so that other ways of
@@ -40,7 +42,10 @@ class Sensor(Protocol):
     name: str  # "sonar", "camera"; also the name of its config table
     role: Literal["poll", "look"]
 
-    def read(self, abort: threading.Event) -> Reading: ...
+    def read(self) -> Reading: ...
+    def hold(self) -> None: ...  # cut a read under way short, and refuse new ones
+    def release(self) -> None: ...
+    def describe(self) -> str: ...  # the device, for logs and status
 ```
 
 How the sensors we have, and the likely next ones, map onto it:
@@ -122,9 +127,9 @@ side by side. Three ways to give it the same footing:
   plays to a built-in speaker today; external speakers would need an explicit
   opt-in, so that the tone never goes to headphones by accident.
 
-`abort` is the monitor's hold event. When it is set (sensing paused or
-inhibited) a read must return `UNKNOWN` promptly, so that `Pause` and `Inhibit`
-can reply only once the speaker and camera are free, as they do now.
+While a sensor is held (sensing paused or inhibited) a read must return
+`UNKNOWN` promptly, so that `Pause` and `Inhibit` can reply only once the
+speaker and camera are free.
 
 ## Deciding
 
@@ -208,19 +213,13 @@ command with `role = "look"` is run only when the monitor wants a look, which
 suits a check that is slow or has side effects. Each `[command.<name>]` table
 is its own sensor, named `command.<name>` in status and logs.
 
-## Registry and configuration
+## Configuration
 
-An in-tree registry maps names to factories:
-
-```python
-SENSORS = {"sonar": sonar.make, "camera": ir.make}
-```
-
-Each sensor module owns its settings dataclass, their range checks and its
-`[name]` table; `config.py` walks the registry instead of naming the tables.
-`[sonar]` and `[camera]` keep their current keys, so existing configuration
-files keep working. A factory returns `None` when its sensor is turned off or
-missing, and logs why, as `make_camera` does now.
+`make_sensors` in `service.py` builds the list. Each sensor has a factory
+that returns `None` when the sensor is turned off or missing, and logs why,
+and a `[name]` table in `config.py`. Settings stay in `config.py` rather than
+in each sensor's module, so that `presencectl` can read the configuration
+without importing OpenCV and NumPy.
 
 Third-party sensors written in Python could register through a
 `presenced.sensors` entry point. That waits until someone needs it; `Report`
@@ -241,13 +240,11 @@ not for sensing in general.
 
 ## Order of work
 
-1. `Verdict`, `Reading` and `Sensor`, with `Sonar` and `IRCamera` wrapped to
-   fit. `Monitor` takes lists of sensors. No change in behavior: the monitor
-   tests pass with only their construction changed.
-2. The registry, and configuration per sensor.
-3. `GetStatus` and `presencectl status` per sensor.
-4. `Report` and command sensors, the first new ones.
-5. Bluetooth, from BlueZ's `Connected` property for a paired device. Signal
+1. Done: `Verdict`, `Reading` and sensors, with `Sonar` and `IRCamera` made to
+   fit and `Monitor` taking a list of them; per-sensor configuration and
+   `GetStatus`; the laptop presence sensor.
+2. `Report` and command sensors.
+3. Bluetooth, from BlueZ's `Connected` property for a paired device. Signal
    strength is too noisy to poll.
 
 ## Open questions

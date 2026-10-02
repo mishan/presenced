@@ -24,6 +24,7 @@ from .controls import Controls
 from .desktop import Desktop, call
 from .ir import IRCamera
 from .monitor import Monitor, State
+from .proximity import ProximitySensor
 from .sensor import Verdict
 from .sonar import Sonar
 from .wake import Waker
@@ -441,13 +442,26 @@ class Daemon:
 
 
 def make_sensors(config):
-    return [sensor for sensor in (make_sonar(config.sonar), make_camera(config.camera)) if sensor]
+    sensors = (make_sonar(config.sonar), make_proximity(config.proximity), make_camera(config.camera))
+    return [sensor for sensor in sensors if sensor]
 
 
 def make_sonar(config):
     if not config.enabled:
         return None
     return Sonar(config.tone_hz, config.burst, config.speaker, config.microphone, config.threshold_db)
+
+
+def make_proximity(config):
+    """The laptop's presence sensor, or None if it is turned off or there is none."""
+    if not config.enabled:
+        return None
+    try:
+        return ProximitySensor(config.device)
+    except LookupError as error:
+        # most laptops have none, so only a configured one missing is worth a warning
+        (log.warning if config.device else log.info)("no proximity sensor: %s", error)
+        return None
 
 
 def make_camera(config):
