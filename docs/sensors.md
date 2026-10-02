@@ -4,11 +4,11 @@ Status: the sensor interface, the monitor's rules, per-sensor status and the
 laptop presence sensor (`presenced/proximity.py`) are implemented. `Report`,
 command sensors, Bluetooth and the open questions are still proposals.
 
-presenced knows about two sensors, the sonar and the IR camera, and `Monitor`
-takes them by name. This proposes a common interface so that other ways of
-sensing presence (an mmWave radar, a phone or watch in Bluetooth range, a
+presenced started with two sensors, the sonar and the IR camera, which
+`Monitor` took by name. This describes a common interface so that other ways
+of sensing presence (an mmWave radar, a phone or watch in Bluetooth range, a
 program reporting over D-Bus) can sit alongside them, without changing how the
-sonar and camera behave today.
+sonar and camera behave.
 
 ## Roles
 
@@ -101,10 +101,14 @@ What is known about it so far:
 So for presenced: presence maps straight to `PRESENT` or `ABSENT`, and distance
 can filter out people across the room as `min_face_width` does for the camera.
 Attention is best ignored. One sysfs read per tick is fast enough; the FIFO is
-the way to react at once. The buffer should only be enabled while sensing,
-not while paused, inhibited or while there is input, since the sensor costs
-power while it runs. Neither of the machines this was written on has one, so
-it needs a tester who does.
+the way to react at once. A sysfs read powers the sensor for that read only,
+which is what presenced does now. Whether that is enough for a sensor that, as
+on the X9-15p, stays in standby until its buffer is enabled is untested: such a
+sensor may not answer in time, and a read the kernel gives up on comes back as
+0, as if nobody were there. presenced counts a read that slow as `UNKNOWN`, and
+with nothing able to look, needs absence to last `recheck_after` before it
+means away. Neither of the machines this was written on has one, so it needs a
+tester who does.
 
 A security key is the classic "lock on smart card removal": pulling it out
 means you have left. Inserted means nothing, since a key can stay in all day.
@@ -127,9 +131,10 @@ side by side. Three ways to give it the same footing:
   plays to a built-in speaker today; external speakers would need an explicit
   opt-in, so that the tone never goes to headphones by accident.
 
-While a sensor is held (sensing paused or inhibited) a read must return
-`UNKNOWN` promptly, so that `Pause` and `Inhibit` can reply only once the
-speaker and camera are free.
+While a sensor is held (sensing paused or inhibited), a read that is using
+the speaker or camera must stop promptly and return `UNKNOWN`, so that `Pause`
+and `Inhibit` can reply only once they are free. A read that holds nothing,
+like the presence sensor's, may simply finish.
 
 ## Deciding
 
@@ -142,7 +147,8 @@ While **present**:
   look sensors are read. Any `PRESENT` restarts the count; `ABSENT` twice,
   `recheck_after` apart, means away.
 - A poll sensor `ABSENT` skips the rest of the quiet wait and goes straight to
-  the looks. Only if no look sensor can see does it mean away on its own.
+  the looks. Only if no look sensor can see does it mean away on its own, and
+  then only once it has lasted `recheck_after`.
 - `PRESENT` beats `ABSENT`. When the phone has left but someone is moving at
   the laptop, someone is there. presenced is a convenience, not a security
   boundary, and erring toward present is the safe failure.
@@ -153,6 +159,9 @@ While **away**:
 
 - A poll sensor `PRESENT` asks for a look, no more than once per
   `recheck_after`, so people walking past do not blink the camera every tick.
+  While it lasts and the looks keep missing, the wait doubles, up to
+  `quiet_for`, so a sensor that keeps seeing someone the camera does not
+  (beside the desk, say) does not blink it forever.
 - A look `PRESENT` means present. With no look sensor able to see, a poll
   sensor `PRESENT` is enough.
 

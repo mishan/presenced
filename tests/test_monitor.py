@@ -245,10 +245,19 @@ def test_a_poll_sensor_saying_nobody_is_here_skips_the_quiet_wait():
     assert fake.looks == 2
 
 
-def test_with_nothing_to_look_a_poll_sensor_saying_nobody_is_here_decides_at_once():
+def test_with_nothing_to_look_a_lasting_absence_decides():
     fake, _ = monitor()
     mon = Monitor([gone_sensor()], 30.0, 10.0, clock=fake.clock)
-    assert run_for(fake, mon, 6) == 0
+    assert 10 <= run_for(fake, mon, 30) <= 12
+
+
+def test_with_nothing_to_look_one_absent_reading_is_not_enough():
+    # a presence sensor that times out reads 0, which looks like nobody there
+    fake, _ = monitor()
+    readings = iter([GONE])
+    mon = Monitor([Sensor("proximity", "poll", lambda: next(readings, QUIET))], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 60)
+    assert mon.state is State.PRESENT
 
 
 def test_motion_beats_a_poll_sensor_saying_nobody_is_here():
@@ -306,7 +315,7 @@ def test_a_blind_camera_and_a_poll_sensor_saying_nobody_is_here_go_away():
     run_for(fake, mon, 36)
     assert mon.state is State.PRESENT
     proximity.read = lambda: GONE
-    assert run_for(fake, mon, 6) is not None
+    assert run_for(fake, mon, 15) is not None
     assert mon.state is State.AWAY
 
 
@@ -319,3 +328,16 @@ def test_a_poll_sensor_saying_nobody_is_here_does_not_look_while_away():
     looks = fake.looks
     run_for(fake, mon, 120)
     assert fake.looks == looks
+
+
+def test_a_poll_sensor_that_keeps_seeing_someone_the_camera_does_not_backs_off():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    seeing = Sensor("proximity", "poll", lambda: GONE)
+    mon = Monitor([seeing, fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 30)
+    assert mon.state is State.AWAY
+    looks = fake.looks
+    seeing.read = lambda: MOVING  # someone beside the desk, say
+    run_for(fake, mon, 300)
+    assert fake.looks - looks <= 300 / 30 + 2

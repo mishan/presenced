@@ -136,12 +136,12 @@ async def cmd_status(args):
     if "idle_seconds" in status:
         print(f"Input:    idle {ago(status['idle_seconds'])}")
     print(f"Quiet:    {ago(status['quiet_seconds'])}")
-    for name, values in status["sensors"].items():
+    for name, values in status.get("sensors", {}).items():  # an older daemon has none
         values = {key: variant.value for key, variant in values.value.items()}
         device = values.pop("device", "")
         verdict = values.pop("verdict", "not read yet")
         numbers = ", ".join(
-            f"{key} {value:.1f}" if isinstance(value, float) else f"{key} {value}" for key, value in values.items()
+            f"{key} {value:.2f}" if isinstance(value, float) else f"{key} {value}" for key, value in values.items()
         )
         print(f"{name.capitalize() + ':':<9} {verdict}{f' ({numbers})' if numbers else ''}, {device}")
     client.bus.disconnect()

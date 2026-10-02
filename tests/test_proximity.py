@@ -31,11 +31,22 @@ def test_presence_is_read_from_the_prox_device(tmp_path, files, verdict, detail)
     assert (reading.verdict, reading.detail) == (verdict, detail)
 
 
-def test_a_sensor_that_goes_away_is_unknown(tmp_path):
+def test_a_sensor_that_goes_away_is_unknown_until_it_comes_back(tmp_path):
+    import shutil
+
     path = device(tmp_path, 0, "prox", in_proximity0_raw=1)
     sensor = ProximitySensor(root=tmp_path)
-    (path / "in_proximity0_raw").unlink()
+    shutil.rmtree(path)
     assert sensor.read().verdict is Verdict.UNKNOWN
+    device(tmp_path, 3, "prox", in_proximity0_raw=1)
+    assert sensor.read().verdict is Verdict.UNKNOWN  # found again, read next time
+    assert sensor.read().verdict is Verdict.PRESENT
+
+
+def test_a_sensor_that_does_not_answer_is_unknown_not_absent(tmp_path):
+    device(tmp_path, 0, "prox", in_proximity0_raw=0)
+    times = iter([0.0, 5.0])
+    assert ProximitySensor(root=tmp_path, clock=lambda: next(times)).read().verdict is Verdict.UNKNOWN
 
 
 def test_a_configured_device_need_not_be_named_prox(tmp_path):

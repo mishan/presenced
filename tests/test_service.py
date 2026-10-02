@@ -484,5 +484,5 @@ def test_status_shows_each_sensor(monkeypatch, capsys):
     monkeypatch.setattr(ctl.Client, "connect", classmethod(connect))
     asyncio.run(ctl.cmd_status(None))
     out = capsys.readouterr().out
-    assert "Sonar:    quiet (level_db -24.0, usable True), fake\n" in out
+    assert "Sonar:    quiet (level_db -24.00, usable True), fake\n" in out
     assert "Camera:   not read yet, fake\n" in out

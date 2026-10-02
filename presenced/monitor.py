@@ -40,6 +40,8 @@ class Monitor:
         self.looked_at = None  # when the camera was last asked, while away
         self.blind_at = None  # when the look sensors last saw nothing at all
         self.seen_at = None  # when a look last found someone in this run
+        self.absent_since = None  # start of an unbroken run of poll sensors saying nobody is here
+        self.misses = 0  # looks in a row that found nobody while poll sensors said someone, while away
         self.readings = {}  # the latest reading of each sensor, by name
         self.last_look = None
         # while set, the state is frozen: a step already under way when sensing
@@ -62,11 +64,7 @@ class Monitor:
             if state is self.state or self.hold.is_set():
                 return
             self.state = state
-            self.quiet_since = None if state is State.PRESENT else self.clock()
-            self.missed_at = None
-            self.looked_at = None
-            self.blind_at = None
-            self.seen_at = None
+            self.restart()
             log.info("now %s", state.value)
             if self.on_change:
                 self.on_change(state)
@@ -83,6 +81,8 @@ class Monitor:
         self.looked_at = None
         self.blind_at = None
         self.seen_at = None
+        self.absent_since = None
+        self.misses = 0
 
     def read(self, sensor):
         reading = sensor.read()
@@ -120,6 +120,10 @@ class Monitor:
         moving = Verdict.PRESENT in verdicts
         # someone moving at the laptop is there, whatever else says they left
         absent = not moving and Verdict.ABSENT in verdicts
+        if not absent:
+            self.absent_since = None
+        elif self.absent_since is None:
+            self.absent_since = now
         usable = bool(verdicts - {Verdict.UNKNOWN})
         if moving:
             self.quiet_since = None
@@ -138,7 +142,11 @@ class Monitor:
         # has since found someone: then it is someone sitting still, as with the sonar
         if quiet_s < self.quiet_for and (not absent or self.seen_at is not None):
             return
-        polls_say_away = absent or (usable and quiet_s >= BLIND_PATIENCE * self.quiet_for)
+        # with nothing able to look, one absent reading is not enough: a presence
+        # sensor that times out reads as nobody there, so it has to persist
+        polls_say_away = (absent and now - self.absent_since >= self.recheck_after) or (
+            usable and quiet_s >= BLIND_PATIENCE * self.quiet_for
+        )
         if self.blind_at is not None and now - self.blind_at < self.quiet_for:
             # the camera was blind a moment ago (shutter closed?): rely on the
             # poll sensors for now rather than blink the camera every probe
@@ -166,14 +174,21 @@ class Monitor:
 
     def step_away(self, now, quiet_s, moving, usable):
         if moving:
-            # people walking past should not blink the camera every probe
-            if self.looked_at is not None and now - self.looked_at < self.recheck_after:
+            # people walking past should not blink the camera every probe, and a
+            # poll sensor that keeps seeing someone the camera does not (beside the
+            # desk, say) should not blink it forever: back off while that lasts
+            wait = min(self.recheck_after * 2 ** self.misses, self.quiet_for)
+            if self.looked_at is not None and now - self.looked_at < wait:
                 return
-        elif usable or quiet_s < self.quiet_for:
-            return
+        else:
+            self.misses = 0
+            if usable or quiet_s < self.quiet_for:
+                return
         self.looked_at = now
         if not moving:
             self.quiet_since = now  # without poll sensors, look again after another quiet period
         seen = self.look().verdict
         if seen is Verdict.PRESENT or (seen is Verdict.UNKNOWN and moving):
             self.switch(State.PRESENT)
+        elif moving:
+            self.misses += 1
