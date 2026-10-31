@@ -54,7 +54,8 @@ minutes, so the camera LED lights now and then, even while you are moving. Sonar
 motion alone never holds the desktop off, so with the camera blind or missing
 the desktop's timers run as usual, and they still apply if presenced stops. If
 you leave but something keeps moving, the desktop can take up to about ten
-minutes to lock. This needs `org.freedesktop.ScreenSaver.Inhibit`; tested on GNOME.
+minutes to lock. This needs `org.freedesktop.ScreenSaver.Inhibit`, which GNOME and KDE offer and
+Xfce and sway do not.
 Set `keep_awake = false` under `[sensing]` to turn it off. An idle delay under
 about 40 seconds can run out before the first look.
 
@@ -71,8 +72,9 @@ do that. After a suspend, sensing simply starts counting again.
 - A laptop with built-in speakers and microphones that pass 20 kHz (most do;
   `presencectl calibrate` tells you), and ideally an IR camera
 - For input idle time: GNOME, or a desktop that implements
-  `org.freedesktop.ScreenSaver.GetSessionIdleTime` (KDE). Elsewhere sensing
-  also runs while you type.
+  `org.freedesktop.ScreenSaver.GetSessionIdleTime`. Elsewhere sensing also runs
+  while you type. KDE on Wayland refuses that call (measured on a headless
+  session), so it is one of those places.
 
 ## Install
 

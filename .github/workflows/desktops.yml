@@ -1,0 +1,21 @@
+name: desktops
+
+# Real desktops in containers, slow and with a lot to download, so kept apart
+# from the tests and run only when what they check changes.
+on:
+  push:
+    paths: ["rig/**", "presenced/keep.py", "presenced/desktop.py", ".github/workflows/desktops.yml"]
+  schedule:
+    - cron: "17 4 * * 1"  # desktops change even when this code does not
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        desktop: [gnome, kde, sway]
+    steps:
+      - uses: actions/checkout@v5
+      - run: rig/run.sh ${{ matrix.desktop }}

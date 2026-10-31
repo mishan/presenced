@@ -238,6 +238,30 @@ stretches. `keep_awake_every` has a minimum of 10.
 - **Live on GNOME:** idle past `idle-delay` with a face in view; then leave;
   then a video ending past `idle-delay` with a face in view.
 
+## What real desktops do
+
+Measured with `rig/run.sh`, which runs presenced's own `Keeper` and `Desktop` on
+a real desktop in a container. Each row a desktop has a value for is required of
+it, so a change fails the run, and a run that tested nothing does not pass:
+
+| | GNOME 50 | KDE (Fedora 44) | Xfce | sway |
+|---|---|---|---|---|
+| `org.freedesktop.ScreenSaver` | yes | yes | no | no |
+| `Inhibit` works | yes | yes | no | no |
+| `PowerManagement.HasInhibit` | no service | yes | yes | no service |
+| It shows our hold | n/a | yes, 5 s late or so | n/a | n/a |
+| Lists inhibitors by owner | yes | no | yes, unused | n/a |
+| Input idle time | Mutter | refused | none | none |
+| `GetActive` | refused | works | n/a | n/a |
+| A release resets the idle time | yes | unmeasured, no idle time | n/a | n/a |
+| A dropped connection clears the hold | yes | yes | n/a | n/a |
+
+KDE is the mixed case, so `MIXED_WITHIN_S` is doing real work there, and no
+MPRIS fallback is needed: `HasInhibit` is reliable enough once ours is told
+apart. Xfce has `org.xfce.ScreenSaver.Inhibit` instead, and `rig/run.sh xfce`
+fails until presenced uses it. The rig cannot show a lock happen, as headless
+Shell has no screen shield.
+
 ## Decisions
 
 - Inhibit, not simulated activity or a nudge (see above).
