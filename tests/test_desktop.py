@@ -122,3 +122,136 @@ def test_other_desktops_have_no_watch():
     d.idle_source = desktop.IDLE_SOURCES[1]
     assert asyncio.run(d.watch_input()) is None
     assert bus.watches == 0
+
+
+class SessionBus:
+    """GNOME's session manager, or else the power management interface."""
+
+    def __init__(self, inhibitors=None, has_inhibit=False, get_active=None):
+        self.inhibitors = inhibitors  # {path: (app id, flags)}; None: not GNOME
+        self.has_inhibit = has_inhibit
+        self.get_active = get_active
+        self.calls = []
+
+    async def call(self, message):
+        self.calls.append(message.member)
+        if message.member == "GetActive":
+            return Reply(error=True) if self.get_active is None else Reply([self.get_active])
+        if message.member == "HasInhibit":
+            return Reply([self.has_inhibit])
+        if self.inhibitors is None:
+            return Reply(error=True)
+        if message.member == "IsInhibited":
+            return Reply([any(flags & 8 for _, flags in self.inhibitors.values())])
+        if message.member == "GetInhibitors":
+            return Reply([list(self.inhibitors)])
+        if message.path not in self.inhibitors:
+            return Reply(error=True)  # gone since it was listed
+        app, flags = self.inhibitors[message.path]
+        return Reply([app if message.member == "GetAppId" else flags])
+
+
+@pytest.mark.parametrize(
+    "inhibitors, expected",
+    [
+        ({}, False),
+        ({"/ours": ("presenced", 8)}, False),
+        ({"/ours": ("presenced", 8), "/video": ("firefox", 8)}, True),
+        ({"/ours": ("presenced", 8), "/suspend": ("electron", 4)}, False),
+    ],
+    ids=["none", "only ours", "ours and a video", "ours and another kind"],
+)
+def test_our_own_inhibitor_is_not_taken_for_a_video(inhibitors, expected):
+    d = desktop.Desktop(SessionBus(inhibitors), SilentBus())
+    assert asyncio.run(d.idle_inhibited()) is expected
+
+
+def test_an_inhibitor_gone_since_it_was_listed_is_skipped():
+    bus = SessionBus({"/ours": ("presenced", 8)})
+    real = bus.call
+
+    async def vanishing(message):
+        reply = await real(message)
+        if message.member == "GetInhibitors":
+            reply.body[0].append("/gone")
+        return reply
+
+    bus.call = vanishing
+    assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is False
+
+
+@pytest.mark.parametrize(
+    "answers, expected",
+    [
+        ([(1.0, False), (20.0, True)], True),  # never showed ours, so this is a video
+        ([(1.0, True), (20.0, True)], False),  # showed ours from the start
+        ([(7.0, False), (9.0, True), (60.0, True)], False),  # showed ours, but late
+    ],
+    ids=["separate", "mixed", "mixed, late"],
+)
+def test_where_only_has_inhibit_exists_our_own_hold_is_told_from_a_video(answers, expected):
+    now, bus = [0.0], SessionBus(has_inhibit=False)
+    d = desktop.Desktop(bus, SilentBus(), clock=lambda: now[0])
+    d.holding(True)
+    for at, bus.has_inhibit in answers:
+        now[0] = at
+        result = asyncio.run(d.idle_inhibited())
+    assert result is expected
+
+
+def test_with_no_hold_has_inhibit_is_taken_at_its_word():
+    bus = SessionBus(has_inhibit=False)
+    d = desktop.Desktop(bus, SilentBus())
+    d.holding(True)
+    bus.has_inhibit = True
+    asyncio.run(d.idle_inhibited())
+    d.holding(False)
+    assert asyncio.run(d.idle_inhibited()) is True
+
+
+class Lock:
+    def __init__(self, hint):
+        self.hint = hint
+
+    async def call(self, message):
+        if message.member == "GetUser":
+            return Reply(["/user"])
+        if message.member == "Get" and message.body[1] == "Display":
+            return Reply([SimpleNamespace(value=("c1", "/session"))])
+        return Reply([SimpleNamespace(value=self.hint)])
+
+
+@pytest.mark.parametrize(
+    "hint, active, expected",
+    [(True, None, True), (False, None, False), (False, False, False), (False, True, True)],
+)
+def test_a_screen_saver_can_say_locked_where_logind_does_not(hint, active, expected):
+    d = desktop.Desktop(SessionBus(get_active=active), Lock(hint))
+    assert asyncio.run(d.locked()) is expected
+
+
+def test_a_refused_get_active_is_not_asked_again_until_its_owner_changes():
+    bus = SessionBus()
+    d = desktop.Desktop(bus, Lock(False))
+    asyncio.run(d.locked())
+    asyncio.run(d.locked())
+    assert bus.calls.count("GetActive") == 1
+    d.owner_changed("org.freedesktop.ScreenSaver")
+    asyncio.run(d.locked())
+    assert bus.calls.count("GetActive") == 2
+
+
+def test_a_hung_screen_saver_does_not_fail_the_lock_check(monkeypatch):
+    monkeypatch.setattr(desktop, "CALL_TIMEOUT_S", 0.05)
+    assert asyncio.run(desktop.Desktop(SilentBus(), Lock(False)).locked()) is False
+
+
+def test_an_inhibitor_list_that_cannot_be_read_counts_as_someone_elses():
+    bus = SessionBus({"/video": ("firefox", 8)})
+    real = bus.call
+
+    async def refusing(message):
+        return Reply(error=True) if message.member == "GetInhibitors" else await real(message)
+
+    bus.call = refusing
+    assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is True

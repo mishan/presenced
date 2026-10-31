@@ -90,14 +90,17 @@ counts a full idle delay from there (see below).
 
     class Keeper:
         held: bool
-        async def want(self, wanted: bool)  # take or release; never raises
+        released_at: float | None           # the idle count may restart at this moment
+        async def want(self, wanted: bool)  # take or release; bounded, never raises
         def lost(self)                      # the service went away: forget the cookie
 
 `Daemon.tick` calls `keeper.want(...)` in a `finally`, so every path through
 `sense` ends in the right state. The value is `monitor.attended` and the mode
 is `sensing` or `input`: `watching` (locked), `paused`, `inhibited` and `locked`
 all release. `locked()` also asks `org.freedesktop.ScreenSaver.GetActive`, since
-a compositor may never set logind's `LockedHint`.
+a compositor may never set logind's `LockedHint`. GNOME refuses that call
+(measured); it does set the hint, so a refusal stops the asking until the
+service changes hands.
 
 `attended` is false during any hold and `release()` runs `restart()`, so the
 daemon cannot just follow it here: it keeps the hold through `held` itself, and
@@ -163,19 +166,14 @@ the idle delay to lock, ten minutes by default. A quiet departure still ends in
 
 1. GNOME: `GetInhibitors`, then each one's `GetAppId` and `GetFlags`; true if
    any has the idle flag and is not `presenced`.
-2. Elsewhere: `org.freedesktop.PowerManagement.Inhibit`. Its `GetInhibitors`
-   lists `(app, reason)` where offered; filter the same way.
-3. If only `HasInhibit` exists, do not take a hold while it is true, and check
-   it right after taking one. Still false: the two interfaces are separate,
-   ours is not visible, and `HasInhibit` stays reliable. True: they are mixed,
-   so report false while we hold. A video started during a hold is then
-   misread as no inhibitor at all.
-
-The desktop rig records which desktops fall into the mixed case. If a real one
-does, that case would use MPRIS (a player reporting `Playing`) as its video
-signal, at the cost of music counting too. Not built until one is found.
-Releasing briefly to read `HasInhibit` is rejected: with idle past its limit,
-that gap can lock the user.
+2. Elsewhere: `HasInhibit` on `org.freedesktop.PowerManagement.Inhibit`. With
+   `respect_idle_inhibitors` on, a true answer means `held`, so no hold starts
+   during a video. During a hold, a true answer within `MIXED_WITHIN_S` (10 s) of
+   taking it is ours, however late it shows, and from then on `HasInhibit` is
+   ignored while we hold, so a video started during a hold goes unseen. If it
+   stayed false that long, the interfaces are separate and a true answer is a
+   video. Read wrongly the other way, ours would pass for a video and stop
+   sensing, so `held` must not renew the hold's deadline.
 
 An inhibitor that vanishes between `GetInhibitors` and `GetAppId` is skipped.
 GNOME reports our app id as `presenced` (measured).
@@ -195,8 +193,9 @@ stretches. `keep_awake_every` has a minimum of 10.
 
 | What | What happens |
 |---|---|
-| No `org.freedesktop.ScreenSaver` | logged once, no hold, retried after a name owner change |
-| `Inhibit` errors or times out | logged once, retried next tick; no hold |
+| No `org.freedesktop.ScreenSaver` | logged once, no hold, tried again whenever a hold is wanted |
+| `Inhibit` errors | logged once, retried next tick; no hold |
+| `Inhibit` never answers | logged once; only the tick that sent it waits, and no second one is sent until it ends |
 | `Inhibit` answers late | the call is shielded and stays in flight, so no second one is sent; a late cookie that is no longer wanted gets `UnInhibit` |
 | Sensing thread wedges | the deadline releases after `KEEP_FOR` |
 | `UnInhibit` fails | cookie forgotten, logged; the service has probably gone |

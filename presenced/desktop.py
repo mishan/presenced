@@ -8,6 +8,8 @@ import time
 
 from dbus_fast import Message, MessageType
 
+from .keep import APP, SCREENSAVER
+
 log = logging.getLogger("presenced")
 
 MUTTER_IDLE = "org.gnome.Mutter.IdleMonitor"
@@ -23,6 +25,9 @@ IDLE_SOURCES = [
 LOGIND = "org.freedesktop.login1"
 CALL_TIMEOUT_S = 5.0
 
+SAVER_PATH = "/org/freedesktop/ScreenSaver"
+MIXED_WITHIN_S = 10.0  # HasInhibit shows our own inhibitor by this long after we take it, if at all
+GNOME_SESSION = ("org.gnome.SessionManager", "/org/gnome/SessionManager")
 GNOME_INHIBIT_IDLE = 8  # the "don't go idle" flag of GNOME's session manager inhibitors
 
 
@@ -65,6 +70,9 @@ class Desktop:
         self.idle_source = None
         self.warned_no_idle = False
         self.armed_at = None  # when the watch now in place was added; inf once it fired, as each does once
+        self.saver_refused = False  # the screen saver will not say whether it is active
+        self.held_at = None  # when we took the idle inhibitor we hold
+        self.mixed = False  # and HasInhibit counts it, so it cannot tell ours from a video
 
     def on_message(self, message):
         if (
@@ -77,6 +85,8 @@ class Desktop:
     def owner_changed(self, name):
         if name == MUTTER_IDLE:
             self.armed_at = None  # its watches went with it
+        elif name == SCREENSAVER:
+            self.saver_refused = False
 
     async def arm(self):
         self.armed_at = self.clock()  # before the call: the signal can be handled before the reply
@@ -137,23 +147,58 @@ class Desktop:
     async def locked(self):
         """Whether the graphical session is locked; False if that cannot be told."""
         _, path = await self.session()
-        if path is None:
-            return False
-        hint = await get_property(
+        hint = path is not None and await get_property(
             self.system_bus, LOGIND, path, "org.freedesktop.login1.Session", "LockedHint"
         )
-        return bool(hint)
+        return bool(hint) or await self.saver_active()
 
+    async def saver_active(self):
+        """Whether the screen saver says it is on, for compositors that never set logind's hint.
+
+        GNOME refuses to say; it does set the hint. A refusal is final, as this is asked every tick.
+        """
+        if self.saver_refused:
+            return False
+        try:
+            body = await call(self.session_bus, SCREENSAVER, SAVER_PATH, SCREENSAVER, "GetActive")
+        except TimeoutError:
+            return False
+        self.saver_refused = body is None
+        return bool(body and body[0])
 
     async def idle_inhibited(self):
-        """Whether a program asked the desktop not to go idle, as video players do."""
+        """Whether another program asked the desktop not to go idle, as video players do."""
+        body = await call(self.session_bus, *GNOME_SESSION, GNOME_SESSION[0], "IsInhibited", "u", (GNOME_INHIBIT_IDLE,))
+        if body is not None:
+            return bool(body[0]) and await self.another_inhibitor()
+        inhibited = await self.has_inhibit()
+        if inhibited and self.held_at is not None:
+            # right after we took ours, this is ours, however late it shows; were it
+            # read as a video, sensing would stop and the hold would never end
+            self.mixed = self.mixed or self.clock() - self.held_at < MIXED_WITHIN_S
+            return not self.mixed
+        return inhibited
+
+    async def another_inhibitor(self):
+        listed = await call(self.session_bus, *GNOME_SESSION, GNOME_SESSION[0], "GetInhibitors")
+        if listed is None:
+            return True
+        for path in listed[0]:
+            inhibitor = (GNOME_SESSION[0], path, f"{GNOME_SESSION[0]}.Inhibitor")
+            flags = await call(self.session_bus, *inhibitor, "GetFlags")
+            app = await call(self.session_bus, *inhibitor, "GetAppId")
+            if flags and app and flags[0] & GNOME_INHIBIT_IDLE and app[0] != APP:
+                return True
+        return False
+
+    async def has_inhibit(self):
         body = await call(
-            self.session_bus, "org.gnome.SessionManager", "/org/gnome/SessionManager",
-            "org.gnome.SessionManager", "IsInhibited", "u", (GNOME_INHIBIT_IDLE,),
+            self.session_bus, "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement/Inhibit",
+            "org.freedesktop.PowerManagement.Inhibit", "HasInhibit",
         )
-        if body is None:
-            body = await call(
-                self.session_bus, "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement/Inhibit",
-                "org.freedesktop.PowerManagement.Inhibit", "HasInhibit",
-            )
         return bool(body and body[0])
+
+    def holding(self, held):
+        """Note that we took or gave back our inhibitor."""
+        self.held_at = self.clock() if held else None
+        self.mixed = False
