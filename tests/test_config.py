@@ -49,3 +49,10 @@ def test_rendered_template_reads_back_the_same():
 def test_out_of_range_values_are_errors(text):
     with pytest.raises(ConfigError, match="must be"):
         parse(text)
+
+
+def test_keeping_awake_is_on_by_default_and_its_interval_has_a_floor():
+    assert parse("").sensing.keep_awake
+    assert parse("").sensing.keep_awake_every == 120.0
+    with pytest.raises(ConfigError):
+        parse("[sensing]\nkeep_awake_every = 5")

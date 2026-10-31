@@ -24,6 +24,8 @@ class Sensing:
     recheck_after: float = 10.0  # seconds between the two empty looks that mean away
     interval: float = 3.0  # seconds between sonar probes
     respect_idle_inhibitors: bool = True  # while a video plays, sense nothing and change nothing
+    keep_awake: bool = True  # hold the desktop's idle timers off while a face is in view
+    keep_awake_every: float = 120.0  # seconds between camera looks while there is motion but no input
 
 
 @dataclass
@@ -82,6 +84,7 @@ LIMITS = {
     "sensing.quiet_for": (1.0, None),
     "sensing.recheck_after": (0.0, None),
     "sensing.interval": (0.5, 60.0),
+    "sensing.keep_awake_every": (10.0, None),
     "sonar.tone_hz": (15000.0, 23500.0),  # below is audible to most people, above aliases at 48 kHz
     "sonar.burst": (1.0, 10.0),  # shorter leaves too little steady tone to measure
     "sonar.threshold_db": (-80.0, 0.0),
@@ -146,6 +149,12 @@ interval = {sensing.interval:g}
 # players do during playback, sense nothing and leave the state as it is. Your
 # desktop itself would not blank or lock the screen then either.
 respect_idle_inhibitors = {idle_inhibitors}
+# Hold the desktop's dimming, locking and suspending off while the camera sees
+# you, since it only counts keyboard and mouse. Motion alone does not hold it off.
+keep_awake = {keep_awake}
+# Seconds between camera looks while there is no input. The first comes sooner,
+# after quiet_for if that is shorter. The camera LED lights each time.
+keep_awake_every = {sensing.keep_awake_every:g}
 
 [sonar]
 enabled = {sonar_enabled}
@@ -197,6 +206,7 @@ def render(config):
         camera=config.camera,
         actions=config.actions,
         idle_inhibitors=str(config.sensing.respect_idle_inhibitors).lower(),
+        keep_awake=str(config.sensing.keep_awake).lower(),
         sonar_enabled=str(config.sonar.enabled).lower(),
         camera_enabled=str(config.camera.enabled).lower(),
         proximity_enabled=str(config.proximity.enabled).lower(),

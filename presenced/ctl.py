@@ -135,6 +135,8 @@ async def cmd_status(args):
         print(f"Inhibited by {who}: {why}")
     if "idle_seconds" in status:
         print(f"Input:    idle {ago(status['idle_seconds'])}")
+    if status.get("keeping_awake"):
+        print("Desktop:  kept awake")
     print(f"Quiet:    {ago(status['quiet_seconds'])}")
     for name, values in status.get("sensors", {}).items():  # an older daemon has none
         values = {key: variant.value for key, variant in values.value.items()}

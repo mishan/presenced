@@ -7,6 +7,7 @@ import pytest
 from dbus_fast import MessageType
 from dbus_fast.errors import DBusError
 
+from presenced import service
 from presenced.config import Config
 from presenced.monitor import State
 from presenced.sensor import Reading, Verdict
@@ -47,6 +48,8 @@ class FakeMonitor:
         self.on_change = None
         self.steps = 0
         self.restarts = 0
+        self.attended = False
+        self.looks_soon = 0
 
     def step(self):
         self.steps += 1
@@ -55,12 +58,31 @@ class FakeMonitor:
 
     def active(self):
         self.state = State.PRESENT
+        self.attended = False  # as restart() clears what was seen
 
     def restart(self):
         self.restarts += 1
 
     def freeze(self):
         self.hold.set()
+
+    def look_soon(self):
+        self.looks_soon += 1
+
+
+class FakeKeeper:
+    def __init__(self):
+        self.held = False
+        self.wants = []
+        self.losses = 0
+        self.released_at = None
+
+    async def want(self, wanted):
+        self.wants.append(wanted)
+        self.held = wanted
+
+    def lost(self):
+        self.losses += 1
 
 
 class FakeDesktop:
@@ -70,6 +92,7 @@ class FakeDesktop:
         self.inhibited = inhibited
         self.silent_since = None
         self.ticks_watched = 0
+        self.holdings = []
 
     async def idle_inhibited(self):
         return self.inhibited
@@ -86,6 +109,9 @@ class FakeDesktop:
 
     def owner_changed(self, name):
         pass
+
+    def holding(self, held):
+        self.holdings.append(held)
 
 
 class FakeWaker:
@@ -599,3 +625,129 @@ def test_an_idle_monitor_changing_hands_reaches_the_desktop():
         path="/org/freedesktop/DBus", body=["some.name", ":1.1", ":1.2"],
     ))
     assert seen == ["some.name"]
+
+
+def keeping(locked=False, idle=600.0, attended=True, wake=True):
+    d, monitor, _ = daemon(wake=wake, locked=locked, idle=idle)
+    d.keeper = FakeKeeper()
+    monitor.state = monitor.next_state = State.PRESENT
+    monitor.attended = attended
+    return d, monitor, d.keeper
+
+
+@pytest.mark.parametrize(
+    "locked, idle, attended, wanted",
+    [
+        (False, 600.0, True, True),
+        (False, 600.0, False, False),
+        (False, 1.0, True, False),
+        (True, 600.0, True, False),
+    ],
+    ids=["sensing", "nobody seen", "input resets it", "locked"],
+)
+def test_the_desktop_is_kept_awake_only_for_someone_seen_at_an_unlocked_screen(locked, idle, attended, wanted):
+    d, monitor, keeper = keeping(locked, idle, attended)
+    tick(d)
+    assert keeper.wants == [wanted]
+
+
+@pytest.mark.parametrize("locked", [True, False])
+def test_the_camera_is_only_forced_on_at_an_unlocked_screen(locked):
+    d, monitor, _ = keeping(locked=locked)
+    tick(d)
+    assert monitor.force_looks is not locked
+
+
+def test_locked_with_sensing_off_gives_the_hold_back():
+    d, _, keeper = keeping(locked=True, wake=False)
+    keeper.held = True
+    tick(d)
+    assert keeper.wants == [False]
+
+
+def test_pausing_gives_the_hold_back():
+    d, monitor, keeper = keeping()
+    d.controls.pause(0)
+    tick(d)
+    assert keeper.wants == [False]
+
+
+def test_a_failing_tick_still_settles_the_hold():
+    d, monitor, keeper = keeping()
+
+    def broken():
+        raise RuntimeError("no")
+
+    monitor.step = broken
+    with pytest.raises(RuntimeError):
+        tick(d)
+    assert keeper.wants == [True]
+
+
+def test_a_video_leaves_the_hold_alone_and_does_not_renew_it():
+    d, monitor, keeper = keeping()
+    tick(d)
+    d.desktop.inhibited = True
+    tick(d)
+    assert keeper.wants == [True]
+
+
+def test_leaving_a_hold_looks_at_once():
+    d, monitor, keeper = keeping()
+    d.desktop.inhibited = True
+    tick(d)
+    assert monitor.looks_soon == 0
+    d.desktop.inhibited = False
+    tick(d)
+    assert monitor.looks_soon == 1
+
+
+def test_the_desktop_hears_of_the_hold_changing_and_only_then():
+    d, monitor, keeper = keeping()
+    tick(d)
+    tick(d)
+    monitor.attended = False
+    tick(d)
+    assert d.desktop.holdings == [True, False]
+
+
+def test_our_own_release_is_not_input_where_nothing_watches_for_it():
+    now = [100.0]
+    d, monitor, keeper = keeping(idle=0.7, attended=False)
+    d.clock = lambda: now[0]
+    monitor.state = monitor.next_state = State.AWAY
+    keeper.released_at = 99.5
+    tick(d)
+    assert monitor.state is State.AWAY
+
+
+def test_the_screen_saver_changing_hands_reaches_the_keeper():
+    d, _, keeper = keeping()
+    for name, losses in (("some.name", 0), ("org.freedesktop.ScreenSaver", 1)):
+        d.on_message(SimpleNamespace(
+            message_type=MessageType.SIGNAL, member="NameOwnerChanged", sender="org.freedesktop.DBus",
+            path="/org/freedesktop/DBus", body=[name, ":1.1", ":1.2"],
+        ))
+        assert keeper.losses == losses
+
+
+def test_status_says_whether_the_desktop_is_kept_awake():
+    d, _, keeper = keeping()
+    assert d.status()["keeping_awake"].value is False
+    tick(d)
+    assert d.status()["keeping_awake"].value is True
+
+
+def test_without_keeping_awake_the_daemon_runs_as_before():
+    d, monitor, _ = daemon(locked=False)
+    tick(d)
+    assert d.status()["keeping_awake"].value is False
+    assert d.desktop.holdings == []
+
+
+@pytest.mark.parametrize("enabled, look_every", [(True, 120.0), (False, None)])
+def test_the_setting_reaches_the_monitor(monkeypatch, enabled, look_every):
+    monkeypatch.setattr(service, "make_sensors", lambda config: [])
+    config = Config()
+    config.sensing.keep_awake = enabled
+    assert Daemon(config, waker=FakeWaker()).monitor.look_every == look_every

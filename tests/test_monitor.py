@@ -561,3 +561,29 @@ def test_a_retry_does_not_let_attended_lapse_before_the_next_look():
         mon.step()
         fake.now += INTERVAL
     assert all(attended)
+
+
+def test_a_look_can_be_asked_for_at_once_and_a_miss_is_retried():
+    fake, mon = keeping()
+    run_for(fake, mon, 12)
+    mon.look_soon()
+    fake.seen = EMPTY
+    run_for(fake, mon, 3)
+    assert fake.looks == 1
+    assert mon.retry_at is not None
+
+
+def test_a_locked_screen_gets_no_forced_looks():
+    fake, mon = keeping()
+    mon.force_looks = False
+    mon.look_soon()
+    run_for(fake, mon, 600)
+    assert fake.looks == 0
+
+
+def test_a_hold_lasts_as_long_as_a_face_counts():
+    fake, mon = keeping()
+    assert mon.keep_for == 310.0
+    run_for(fake, mon, 33)
+    fake.now = mon.sure_at + mon.keep_for - 1
+    assert mon.attended

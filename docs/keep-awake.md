@@ -1,6 +1,6 @@
 # Keeping the desktop awake: design
 
-Status: agreed; not yet built.
+Status: implemented. The desktop rig is still to come.
 
 The desktop counts only keyboard and mouse input. Sit and read for five
 minutes and GNOME locks the screen, even though the camera can see you. This
@@ -94,10 +94,12 @@ counts a full idle delay from there (see below).
         async def want(self, wanted: bool)  # take or release; bounded, never raises
         def lost(self)                      # the service went away: forget the cookie
 
-`Daemon.tick` calls `keeper.want(...)` in a `finally`, so every path through
+`Daemon.tick` calls `Daemon.keep_awake` in a `finally`, so every path through
 `sense` ends in the right state. The value is `monitor.attended` and the mode
-is `sensing` or `input`: `watching` (locked), `paused`, `inhibited` and `locked`
-all release. `locked()` also asks `org.freedesktop.ScreenSaver.GetActive`, since
+is `sensing`. `watching` (locked), `paused`, `inhibited` and `locked` all release,
+and so does `input`, because input clears `sure_at`: a hold ends with each burst
+of typing and returns with the next look. That is harmless, as the desktop is not
+idle then. No forced looks run while locked, so the LED stays dark. `locked()` also asks `org.freedesktop.ScreenSaver.GetActive`, since
 a compositor may never set logind's `LockedHint`. GNOME refuses that call
 (measured); it does set the hint, so a refusal stops the asking until the
 service changes hands.
@@ -204,6 +206,8 @@ stretches. `keep_awake_every` has a minimum of 10.
 | Suspend during a hold | `restart()` clears `sure_at`; released on the first tick after resume |
 | Camera blind or missing | `sure_at` never set or lapses; desktop timers run |
 | Idle delay under about 40 s | the desktop can lock before the first look; lower `quiet_for` and `keep_awake_every`; documented |
+| A video outlasts the deadline, on a desktop that does not restart its idle count | our hold has lapsed, so the desktop can lock as the video ends, before the look. GNOME is safe. Not renewing during `held` is what ends a misread hold |
+| Inhibit answers after a tick, where HasInhibit is mixed | our hold reads as a video until the deadline, at most `KEEP_FOR` |
 | Face in a photo on the desk | held indefinitely, with no liveness check. Worse than today, when the desktop timer still locks; and `on_away` is empty by default |
 
 ## Test plan

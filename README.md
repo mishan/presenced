@@ -46,6 +46,18 @@ sonar sees motion and the camera sees a face. With the camera blind (the
 privacy shutter closed, say), the sonar decides alone: you count as away after
 three quiet periods (90 seconds by default) and back on the first motion.
 
+The desktop itself only counts the keyboard and mouse, so it would dim, lock and
+suspend on you while you read. While the camera has seen your face in the last
+five minutes or so, presenced holds those timers off with an idle inhibitor. To
+know, it also looks about 30 seconds after your last input and then every two
+minutes, so the camera LED lights now and then, even while you are moving. Sonar
+motion alone never holds the desktop off, so with the camera blind or missing
+the desktop's timers run as usual, and they still apply if presenced stops. If
+you leave but something keeps moving, the desktop can take up to about ten
+minutes to lock. This needs `org.freedesktop.ScreenSaver.Inhibit`; tested on GNOME.
+Set `keep_awake = false` under `[sensing]` to turn it off. An idle delay under
+about 40 seconds can run out before the first look.
+
 While sensing is paused or inhibited, while a video is playing, and while the
 screen is locked (unless waking is on), the state is frozen as it was and no
 actions run. Unlocking the screen counts as present, since only a person can

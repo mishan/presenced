@@ -45,6 +45,8 @@ class Monitor:
         self.sure_at = None  # the same, counting the forced looks, which must not keep other sensors from deciding
         self.since = clock()  # when this run began
         self.retry_at = None  # when to try again after a forced look missed
+        self.look_now = False  # the next step should look
+        self.force_looks = True  # off while locked: there is nothing to hold off, and the LED should stay dark
         self.absent_since = None  # start of an unbroken run of poll sensors saying nobody is here
         self.away_wait = recheck_after  # least time between looks for motion while away; grows with misses
         self.readings = {}  # the latest reading of each sensor, by name
@@ -62,6 +64,10 @@ class Monitor:
         return 0.0 if since is None else self.clock() - since
 
     @property
+    def keep_for(self):
+        return KEEP_LOOKS * self.look_every + self.recheck_after
+
+    @property
     def attended(self):
         """Whether a face was seen lately, the only thing that may hold the desktop off idling."""
         sure = self.sure_at  # once: a step in the sensing thread may clear it meanwhile
@@ -69,7 +75,7 @@ class Monitor:
             self.look_every is not None
             and not self.hold.is_set()
             and sure is not None
-            and self.clock() - sure < KEEP_LOOKS * self.look_every + self.recheck_after
+            and self.clock() - sure < self.keep_for
         )
 
     def freeze(self):
@@ -156,9 +162,15 @@ class Monitor:
         else:
             self.step_away(now, quiet_s, moving, usable)
 
+    def look_soon(self):
+        """Have the next step look, once: what was known before a hold is stale, and may be holding a lock off."""
+        self.look_now = True
+
     def look_due(self, now):
-        if self.look_every is None or not self.looks:
+        if self.look_every is None or not self.looks or not self.force_looks:
             return False
+        if self.look_now:
+            return True
         if self.retry_at is not None:
             return now >= self.retry_at
         if self.looked_at is None:
@@ -169,6 +181,7 @@ class Monitor:
         """Ask whether the face is still there, though the poll sensors are not quiet."""
         retry = self.retry_at is None
         self.retry_at = None
+        self.look_now = False
         self.looked_at = now
         if self.look().verdict is Verdict.PRESENT:
             self.sure_at = now

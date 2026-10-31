@@ -23,6 +23,7 @@ from .config import ConfigError, load
 from .controls import Controls
 from .desktop import Desktop, call
 from .ir import IRCamera
+from .keep import SCREENSAVER, Keeper
 from .monitor import Monitor, State
 from .proximity import ProximitySensor
 from .sensor import Verdict
@@ -137,8 +138,11 @@ class Daemon:
         self.clock = time.monotonic
         self.was_inhibited = False
         self.idle_reset_at = None  # when the desktop last restarted its idle count by itself
+        self.keeper = None
+        self.was_holding = False
         self.monitor = monitor or Monitor(
-            make_sensors(config), config.sensing.quiet_for, config.sensing.recheck_after
+            make_sensors(config), config.sensing.quiet_for, config.sensing.recheck_after,
+            look_every=config.sensing.keep_awake_every if config.sensing.keep_awake else None,
         )
         self.monitor.on_change = self.state_changed
         self.waker = waker or Waker(config.wake.command)
@@ -241,6 +245,7 @@ class Daemon:
             for sensor in self.monitor.sensors:
                 sensor.release()
             self.monitor.restart()  # whatever was counted before the hold is stale now
+            self.monitor.look_soon()
         return True
 
     def pause(self, seconds):
@@ -278,6 +283,7 @@ class Daemon:
                 sensor.name: Variant("a{sv}", sensor_status(sensor, monitor.readings.get(sensor.name)))
                 for sensor in monitor.sensors
             }),
+            "keeping_awake": Variant("b", bool(self.keeper and self.keeper.held)),
             "version": Variant("s", __version__),
         }
         if self.idle_seconds is not None:
@@ -299,6 +305,8 @@ class Daemon:
         ):
             name, _, new_owner = message.body
             self.desktop.owner_changed(name)
+            if name == SCREENSAVER and self.keeper:
+                self.keeper.lost()
             if not new_owner and self.controls.release_owner(name):
                 log.info("inhibitors of %s released: it left the bus", name)
                 self.controls_changed()
@@ -310,7 +318,19 @@ class Daemon:
         try:
             await self.sense()
         finally:
+            await self.keep_awake()
             self.stepping.set()
+
+    async def keep_awake(self):
+        if not self.keeper or self.mode == "held":
+            # held: another program's inhibitor. Ours stays, as giving it back could lock someone
+            # seen a moment ago, but goes unrenewed: if that "program" is really our own
+            # inhibitor misread, the deadline ends it
+            return
+        await self.keeper.want(self.monitor.attended and self.mode == "sensing")
+        if self.keeper.held != self.was_holding:
+            self.was_holding = self.keeper.held
+            self.desktop.holding(self.was_holding)
 
     async def sense(self):
         offset = self.boot_offset()
@@ -364,6 +384,7 @@ class Daemon:
 
         self.set_mode("watching" if locked else "sensing")
         before = self.monitor.state
+        self.monitor.force_looks = not locked
         await asyncio.to_thread(self.monitor.step)
         seen = self.monitor.last_look
         if (
@@ -385,7 +406,8 @@ class Daemon:
         last_event = self.clock() - idle
         if silent_since is not None:
             return last_event <= silent_since
-        return self.idle_reset_at is None or last_event > self.idle_reset_at + IDLE_RESET_SLACK_S
+        resets = [at for at in (self.idle_reset_at, self.keeper and self.keeper.released_at) if at is not None]
+        return not resets or last_event > max(resets) + IDLE_RESET_SLACK_S
 
     async def safe_tick(self):
         """A tick that logs what went wrong instead of ending the daemon, unless it keeps failing."""
@@ -418,6 +440,8 @@ class Daemon:
         session = await MessageBus(bus_type=BusType.SESSION).connect()
         system = await MessageBus(bus_type=BusType.SYSTEM).connect()
         self.desktop = Desktop(session, system)
+        if self.config.sensing.keep_awake:
+            self.keeper = Keeper(session, self.monitor.keep_for)
         self.interface = PresenceInterface(self)
         session.add_message_handler(self.on_message)
         session.add_message_handler(self.desktop.on_message)
