@@ -298,6 +298,7 @@ class Daemon:
             and message.sender == "org.freedesktop.DBus"
         ):
             name, _, new_owner = message.body
+            self.desktop.owner_changed(name)
             if not new_owner and self.controls.release_owner(name):
                 log.info("inhibitors of %s released: it left the bus", name)
                 self.controls_changed()
@@ -317,6 +318,7 @@ class Daemon:
             log.info("resumed from suspend")
             self.monitor.restart()
         self.sleep_offset = offset
+        silent_since = await self.desktop.watch_input()  # before any hold: it must be in place when input comes
 
         if self.controls.paused != self.last_paused:
             self.controls_changed()  # a timed pause ran out
@@ -355,7 +357,7 @@ class Daemon:
             return
 
         self.idle_seconds = await self.desktop.idle_seconds()
-        if self.recent_input():
+        if self.recent_input(silent_since):
             self.set_mode("input")
             self.monitor.active()
             return
@@ -371,15 +373,19 @@ class Daemon:
             log.info("someone came back: waking the screen")
             await self.waker.wake()
 
-    def recent_input(self):
+    def recent_input(self, silent_since):
         """Whether the idle time means someone touched the laptop, not that an idle inhibitor ended.
 
-        Mutter restarts its idle count when the last inhibitor goes, without any input.
+        Mutter restarts its idle count when the last inhibitor goes, without any
+        input. An event no watch fired for was that; with no watch, the timing has to tell.
         """
         idle = self.idle_seconds
         if idle is None or idle >= self.config.sensing.start_after_idle:
             return False
-        return self.idle_reset_at is None or self.clock() - idle > self.idle_reset_at + IDLE_RESET_SLACK_S
+        last_event = self.clock() - idle
+        if silent_since is not None:
+            return last_event <= silent_since
+        return self.idle_reset_at is None or last_event > self.idle_reset_at + IDLE_RESET_SLACK_S
 
     async def safe_tick(self):
         """A tick that logs what went wrong instead of ending the daemon, unless it keeps failing."""
@@ -414,6 +420,7 @@ class Daemon:
         self.desktop = Desktop(session, system)
         self.interface = PresenceInterface(self)
         session.add_message_handler(self.on_message)
+        session.add_message_handler(self.desktop.on_message)
         session.export(OBJECT_PATH, self.interface)
         await call(
             session, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",

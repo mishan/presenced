@@ -2,16 +2,20 @@
 and whether a program has asked it not to go idle."""
 import asyncio
 import logging
+import math
 import os
+import time
 
 from dbus_fast import Message, MessageType
 
 log = logging.getLogger("presenced")
 
+MUTTER_IDLE = "org.gnome.Mutter.IdleMonitor"
+MUTTER_IDLE_PATH = "/org/gnome/Mutter/IdleMonitor/Core"
+
 # (bus name, object, interface, method, seconds per unit), tried in order
 IDLE_SOURCES = [
-    ("org.gnome.Mutter.IdleMonitor", "/org/gnome/Mutter/IdleMonitor/Core",
-     "org.gnome.Mutter.IdleMonitor", "GetIdletime", 0.001),
+    (MUTTER_IDLE, MUTTER_IDLE_PATH, MUTTER_IDLE, "GetIdletime", 0.001),
     ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver",
      "org.freedesktop.ScreenSaver", "GetSessionIdleTime", 1.0),
 ]
@@ -54,11 +58,49 @@ async def get_property(bus, destination, path, interface, name):
 
 
 class Desktop:
-    def __init__(self, session_bus, system_bus):
+    def __init__(self, session_bus, system_bus, clock=time.monotonic):
         self.session_bus = session_bus
         self.system_bus = system_bus
+        self.clock = clock
         self.idle_source = None
         self.warned_no_idle = False
+        self.armed_at = None  # when the watch now in place was added; inf once it fired, as each does once
+
+    def on_message(self, message):
+        if (
+            message.message_type == MessageType.SIGNAL
+            and message.interface == MUTTER_IDLE
+            and message.member == "WatchFired"
+        ):
+            self.armed_at = math.inf
+
+    def owner_changed(self, name):
+        if name == MUTTER_IDLE:
+            self.armed_at = None  # its watches went with it
+
+    async def arm(self):
+        self.armed_at = self.clock()  # before the call: the signal can be handled before the reply
+        try:
+            added = await call(self.session_bus, MUTTER_IDLE, MUTTER_IDLE_PATH, MUTTER_IDLE, "AddUserActiveWatch")
+        except TimeoutError:
+            added = None
+        if added is None:
+            self.armed_at = None
+
+    async def watch_input(self):
+        """Keep a watch for input in place; since when the last one stayed silent.
+
+        inf if it fired, None if there was none. Unlike the idle time, Mutter's
+        user-active watch does not fire when an idle inhibitor ends, so it
+        tells input from that reset.
+        """
+        silent_since = self.armed_at
+        unknown_source = self.idle_source is None  # the idle time may not be read during a hold
+        if (silent_since is None or silent_since == math.inf) and (
+            unknown_source or self.idle_source[0] == MUTTER_IDLE
+        ):
+            await self.arm()
+        return silent_since
 
     async def idle_seconds(self):
         """Seconds since the last keyboard or mouse input, or None if nobody says."""

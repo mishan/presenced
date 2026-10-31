@@ -133,11 +133,14 @@ only if the input it implies, `now - idle_seconds`, falls more than
 This is deliberate and not going away: mutter 4af00ae296 (2018, bgo#705942) does
 it so that idle timeouts do not fire the moment a long inhibitor ends.
 
-Mutter's `AddUserActiveWatch` tells the two apart. Its `WatchFired` stayed silent
-across three `UnInhibit` calls in a real session, and fired on real input on a
-live one. A watch fires once and has to be added again.
+On GNOME, `Desktop.watch_input` uses Mutter's `AddUserActiveWatch` instead of the
+timing above. Its `WatchFired` stayed silent across three `UnInhibit` calls in a
+real session, and fired on real input on a live one. A watch fires once, so the
+tick puts one in place, before any hold. A short idle time is not input if the
+event it implies came after a watch went in place and that watch stayed silent.
+With no watch in place the timing decides, as on a first tick.
 
-Polling leaves two limits. Input between the inhibitor ending and that second
+Elsewhere the timing stays, and polling leaves it two limits. Input between the inhibitor ending and that second
 is not counted unless more follows, so the click that stops a video may go
 unseen. An inhibitor that lives and dies between two ticks is invisible, and
 its reset still reads as input.

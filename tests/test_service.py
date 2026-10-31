@@ -1,6 +1,7 @@
 import asyncio
 import math
 import threading
+from types import SimpleNamespace
 
 import pytest
 from dbus_fast import MessageType
@@ -67,6 +68,8 @@ class FakeDesktop:
         self.is_locked = locked
         self.idle = idle
         self.inhibited = inhibited
+        self.silent_since = None
+        self.ticks_watched = 0
 
     async def idle_inhibited(self):
         return self.inhibited
@@ -76,6 +79,13 @@ class FakeDesktop:
 
     async def idle_seconds(self):
         return self.idle
+
+    async def watch_input(self):
+        self.ticks_watched += 1
+        return self.silent_since
+
+    def owner_changed(self, name):
+        pass
 
 
 class FakeWaker:
@@ -554,3 +564,38 @@ def test_a_hung_session_manager_only_matters_when_its_answer_is_needed(locked, r
     d.desktop.idle_inhibited = hung
     tick(d)
     assert monitor.steps == 1
+
+
+@pytest.mark.parametrize(
+    "silent_since, idle, state",
+    [
+        (97.0, 0.7, State.AWAY),  # the idle count restarted under a silent watch
+        (math.inf, 0.7, State.PRESENT),  # the watch fired
+        (99.0, 4.0, State.PRESENT),  # input just before the watch went in place
+    ],
+)
+def test_where_input_is_watched_a_short_idle_time_needs_the_watch_to_agree(silent_since, idle, state):
+    d, monitor, _ = daemon(locked=False, idle=idle)
+    d.clock = lambda: 100.0
+    d.desktop.silent_since = silent_since
+    tick(d)
+    assert monitor.state is state
+
+
+@pytest.mark.parametrize("locked, wake, inhibited", [(False, True, True), (True, False, False)])
+def test_input_is_watched_while_sensing_is_held(locked, wake, inhibited):
+    d, _, _ = daemon(locked=locked, wake=wake)
+    d.desktop.inhibited = inhibited
+    tick(d)
+    assert d.desktop.ticks_watched == 1
+
+
+def test_an_idle_monitor_changing_hands_reaches_the_desktop():
+    d, _, _ = daemon()
+    seen = []
+    d.desktop.owner_changed = seen.append
+    d.on_message(SimpleNamespace(
+        message_type=MessageType.SIGNAL, member="NameOwnerChanged", sender="org.freedesktop.DBus",
+        path="/org/freedesktop/DBus", body=["some.name", ":1.1", ":1.2"],
+    ))
+    assert seen == ["some.name"]
