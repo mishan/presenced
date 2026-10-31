@@ -23,7 +23,7 @@ from .config import ConfigError, load
 from .controls import Controls
 from .desktop import Desktop, call
 from .ir import IRCamera
-from .keep import SCREENSAVER, Keeper
+from .keep import Keeper
 from .monitor import Monitor, State
 from .proximity import ProximitySensor
 from .sensor import Verdict
@@ -305,8 +305,8 @@ class Daemon:
         ):
             name, _, new_owner = message.body
             self.desktop.owner_changed(name)
-            if name == SCREENSAVER and self.keeper:
-                self.keeper.lost()
+            if self.keeper:
+                self.keeper.lost(name)
             if not new_owner and self.controls.release_owner(name):
                 log.info("inhibitors of %s released: it left the bus", name)
                 self.controls_changed()

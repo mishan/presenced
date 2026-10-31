@@ -127,10 +127,11 @@ def test_other_desktops_have_no_watch():
 class SessionBus:
     """GNOME's session manager, or else the power management interface."""
 
-    def __init__(self, inhibitors=None, has_inhibit=False, get_active=None):
+    def __init__(self, inhibitors=None, has_inhibit=False, get_active=None, power_list=None):
         self.inhibitors = inhibitors  # {path: (app id, flags)}; None: not GNOME
         self.has_inhibit = has_inhibit
         self.get_active = get_active
+        self.power_list = power_list
         self.calls = []
 
     async def call(self, message):
@@ -139,6 +140,8 @@ class SessionBus:
             return Reply(error=True) if self.get_active is None else Reply([self.get_active])
         if message.member == "HasInhibit":
             return Reply([self.has_inhibit])
+        if message.interface == "org.freedesktop.PowerManagement.Inhibit":
+            return Reply(error=True) if self.power_list is None else Reply([self.power_list])
         if self.inhibitors is None:
             return Reply(error=True)
         if message.member == "IsInhibited":
@@ -235,10 +238,10 @@ def test_a_refused_get_active_is_not_asked_again_until_its_owner_changes():
     d = desktop.Desktop(bus, Lock(False))
     asyncio.run(d.locked())
     asyncio.run(d.locked())
-    assert bus.calls.count("GetActive") == 1
+    assert bus.calls.count("GetActive") == 2  # the freedesktop name and Xfce's
     d.owner_changed("org.freedesktop.ScreenSaver")
     asyncio.run(d.locked())
-    assert bus.calls.count("GetActive") == 2
+    assert bus.calls.count("GetActive") == 3
 
 
 def test_a_hung_screen_saver_does_not_fail_the_lock_check(monkeypatch):
@@ -255,3 +258,54 @@ def test_an_inhibitor_list_that_cannot_be_read_counts_as_someone_elses():
 
     bus.call = refusing
     assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is True
+
+
+@pytest.mark.parametrize(
+    "power_list, expected",
+    [([], False), (["presenced"], False), (["presenced", "parole"], True)],
+    ids=["none", "only ours", "ours and a video"],
+)
+def test_a_power_manager_that_lists_inhibitors_is_filtered_like_gnome(power_list, expected):
+    bus = SessionBus(has_inhibit=bool(power_list), power_list=power_list)
+    d = desktop.Desktop(bus, SilentBus())
+    assert asyncio.run(d.idle_inhibited()) is expected
+
+
+def test_the_second_screen_saver_can_say_active():
+    bus = SessionBus()
+    real = bus.call
+
+    async def xfce(message):
+        if message.member == "GetActive" and message.destination == "org.xfce.ScreenSaver":
+            return Reply([True])
+        return await real(message)
+
+    bus.call = xfce
+    assert asyncio.run(desktop.Desktop(bus, Lock(False)).locked()) is True
+
+
+def test_a_saver_saying_no_does_not_stop_the_other_being_asked():
+    bus = SessionBus(get_active=False)
+    real = bus.call
+
+    async def xfce(message):
+        if message.member == "GetActive" and message.destination == "org.xfce.ScreenSaver":
+            return Reply([True])
+        return await real(message)
+
+    bus.call = xfce
+    assert asyncio.run(desktop.Desktop(bus, Lock(False)).locked()) is True
+
+
+@pytest.mark.parametrize(
+    "reply", [Reply(), Reply([[("presenced", "reason")]])], ids=["empty", "pairs, not names"],
+)
+def test_an_inhibitor_list_of_another_shape_falls_back_to_has_inhibit(reply):
+    bus = SessionBus(has_inhibit=False)
+    real = bus.call
+
+    async def odd(message):
+        return reply if message.member == "GetInhibitors" else await real(message)
+
+    bus.call = odd
+    assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is False

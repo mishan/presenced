@@ -4,7 +4,7 @@ import pytest
 from dbus_fast import MessageType
 
 from presenced import keep
-from presenced.keep import Keeper
+from presenced.keep import POWER, XFCE_SAVER, Keeper
 
 
 class Reply:
@@ -160,7 +160,7 @@ def test_a_service_that_went_away_is_asked_afresh():
         saver = Saver()
         keeper = Keeper(saver, 300.0)
         await keeper.want(True)
-        keeper.lost()
+        keeper.lost(keep.SCREENSAVER)
         assert not keeper.held
         await keeper.want(True)
         assert keeper.held and saver.takes == 2
@@ -172,6 +172,7 @@ def test_a_release_is_timed_for_the_idle_reset_it_causes():
     async def scenario():
         now = [50.0]
         keeper = Keeper(Saver(), 300.0, clock=lambda: now[0])
+        await keeper.want(False)  # as every tick without a face does: nothing was released
         assert keeper.released_at is None
         await keeper.want(True)
         assert keeper.released_at is None
@@ -189,7 +190,7 @@ def test_a_reply_arriving_after_the_service_changed_hands_is_still_held_and_give
         keeper = Keeper(saver, 300.0)
         waiting = asyncio.ensure_future(keeper.want(True))
         await asyncio.sleep(0.001)  # the Inhibit is on its way
-        keeper.lost()
+        keeper.lost(keep.SCREENSAVER)
         saver.gate.set()
         await waiting
         await keeper.want(True)
@@ -261,5 +262,103 @@ def test_an_empty_inhibit_reply_is_no_inhibitor():
         keeper = Keeper(saver, 300.0)
         await keeper.want(True)
         assert not keeper.held and keeper.warned
+
+    run(scenario)
+
+
+XFCE_PATHS = (XFCE_SAVER[1], POWER[1])
+
+
+def test_xfce_is_asked_for_its_lock_and_its_suspend_separately_and_both_are_given_back():
+    async def scenario():
+        saver = Saver(paths=XFCE_PATHS)
+        keeper = Keeper(saver, 300.0)
+        await keeper.want(True)
+        assert keeper.held and len(saver.cookies) == 2
+        await keeper.want(False)
+        assert not keeper.held and not saver.cookies
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("path", XFCE_PATHS, ids=["lock only", "suspend only"])
+def test_one_of_xfces_two_is_better_than_none(path):
+    async def scenario():
+        saver = Saver(paths=(path,))
+        keeper = Keeper(saver, 300.0)
+        await keeper.want(True)
+        assert keeper.held and len(saver.cookies) == 1
+
+    run(scenario)
+
+
+def test_the_freedesktop_interface_is_enough_where_it_exists():
+    async def scenario():
+        saver = Saver(paths=("/org/freedesktop/ScreenSaver", *XFCE_PATHS))
+        keeper = Keeper(saver, 300.0)
+        await keeper.want(True)
+        assert len(saver.cookies) == 1
+
+    run(scenario)
+
+
+def test_one_of_two_services_leaving_starts_the_hold_afresh():
+    async def scenario():
+        saver = Saver(paths=XFCE_PATHS)
+        keeper = Keeper(saver, 300.0)
+        await keeper.want(True)
+        keeper.lost(XFCE_SAVER[0])
+        saver.cookies.discard(min(saver.cookies))  # it took its inhibitor with it
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not keeper.held and not saver.cookies
+        await keeper.want(True)
+        assert len(saver.cookies) == 2
+
+    run(scenario)
+
+
+def test_some_other_service_leaving_changes_nothing():
+    async def scenario():
+        keeper = Keeper(Saver(), 300.0)
+        await keeper.want(True)
+        keeper.lost("org.example.Other")
+        assert keeper.held
+
+    run(scenario)
+
+
+def test_a_half_hold_starts_afresh_when_the_other_service_arrives():
+    async def scenario():
+        saver = Saver(paths=(POWER[1],))
+        keeper = Keeper(saver, 300.0)
+        await keeper.want(True)
+        saver.paths = XFCE_PATHS
+        keeper.lost(XFCE_SAVER[0])  # NameOwnerChanged, as it comes up
+        await asyncio.sleep(0)
+        await keeper.want(True)
+        assert len(keeper.holds) == 2
+
+    run(scenario)
+
+
+def test_two_hung_services_give_back_within_one_timeout(monkeypatch):
+    monkeypatch.setattr(keep, "CALL_TIMEOUT_S", 0.05)
+
+    async def scenario():
+        saver = Saver(paths=XFCE_PATHS)
+        keeper = Keeper(saver, 300.0)
+        await keeper.want(True)
+        real = saver.call
+
+        async def hung(message):
+            await asyncio.sleep(3600)
+
+        saver.call = hung
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await keeper.want(False)
+        assert loop.time() - started < 0.09
+        saver.call = real
 
     run(scenario)

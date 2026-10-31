@@ -74,15 +74,15 @@ class FakeKeeper:
     def __init__(self):
         self.held = False
         self.wants = []
-        self.losses = 0
+        self.losses = []
         self.released_at = None
 
     async def want(self, wanted):
         self.wants.append(wanted)
         self.held = wanted
 
-    def lost(self):
-        self.losses += 1
+    def lost(self, name):
+        self.losses.append(name)
 
 
 class FakeDesktop:
@@ -721,14 +721,13 @@ def test_our_own_release_is_not_input_where_nothing_watches_for_it():
     assert monitor.state is State.AWAY
 
 
-def test_the_screen_saver_changing_hands_reaches_the_keeper():
+def test_a_service_changing_hands_reaches_the_keeper():
     d, _, keeper = keeping()
-    for name, losses in (("some.name", 0), ("org.freedesktop.ScreenSaver", 1)):
-        d.on_message(SimpleNamespace(
-            message_type=MessageType.SIGNAL, member="NameOwnerChanged", sender="org.freedesktop.DBus",
-            path="/org/freedesktop/DBus", body=[name, ":1.1", ":1.2"],
-        ))
-        assert keeper.losses == losses
+    d.on_message(SimpleNamespace(
+        message_type=MessageType.SIGNAL, member="NameOwnerChanged", sender="org.freedesktop.DBus",
+        path="/org/freedesktop/DBus", body=["org.freedesktop.ScreenSaver", ":1.1", ":1.2"],
+    ))
+    assert keeper.losses == ["org.freedesktop.ScreenSaver"]
 
 
 def test_status_says_whether_the_desktop_is_kept_awake():

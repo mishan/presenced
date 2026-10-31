@@ -8,7 +8,7 @@ import time
 
 from dbus_fast import Message, MessageType
 
-from .keep import APP, SCREENSAVER
+from .keep import APP, POWER, SCREENSAVER, XFCE_SAVER
 
 log = logging.getLogger("presenced")
 
@@ -25,7 +25,7 @@ IDLE_SOURCES = [
 LOGIND = "org.freedesktop.login1"
 CALL_TIMEOUT_S = 5.0
 
-SAVER_PATH = "/org/freedesktop/ScreenSaver"
+SAVERS = ((SCREENSAVER, "/org/freedesktop/ScreenSaver", SCREENSAVER), XFCE_SAVER)
 MIXED_WITHIN_S = 10.0  # HasInhibit shows our own inhibitor by this long after we take it, if at all
 GNOME_SESSION = ("org.gnome.SessionManager", "/org/gnome/SessionManager")
 GNOME_INHIBIT_IDLE = 8  # the "don't go idle" flag of GNOME's session manager inhibitors
@@ -70,7 +70,7 @@ class Desktop:
         self.idle_source = None
         self.warned_no_idle = False
         self.armed_at = None  # when the watch now in place was added; inf once it fired, as each does once
-        self.saver_refused = False  # the screen saver will not say whether it is active
+        self.silent_savers = set()  # screen savers that will not say whether they are active
         self.held_at = None  # when we took the idle inhibitor we hold
         self.mixed = False  # and HasInhibit counts it, so it cannot tell ours from a video
 
@@ -85,8 +85,7 @@ class Desktop:
     def owner_changed(self, name):
         if name == MUTTER_IDLE:
             self.armed_at = None  # its watches went with it
-        elif name == SCREENSAVER:
-            self.saver_refused = False
+        self.silent_savers = {saver for saver in self.silent_savers if saver[0] != name}
 
     async def arm(self):
         self.armed_at = self.clock()  # before the call: the signal can be handled before the reply
@@ -157,20 +156,27 @@ class Desktop:
 
         GNOME refuses to say; it does set the hint. A refusal is final, as this is asked every tick.
         """
-        if self.saver_refused:
-            return False
-        try:
-            body = await call(self.session_bus, SCREENSAVER, SAVER_PATH, SCREENSAVER, "GetActive")
-        except TimeoutError:
-            return False
-        self.saver_refused = body is None
-        return bool(body and body[0])
+        for saver in SAVERS:
+            if saver in self.silent_savers:
+                continue
+            try:
+                body = await call(self.session_bus, *saver, "GetActive")
+            except TimeoutError:
+                return False
+            if not body:
+                self.silent_savers.add(saver)
+            elif body[0]:
+                return True
+        return False
 
     async def idle_inhibited(self):
         """Whether another program asked the desktop not to go idle, as video players do."""
         body = await call(self.session_bus, *GNOME_SESSION, GNOME_SESSION[0], "IsInhibited", "u", (GNOME_INHIBIT_IDLE,))
         if body is not None:
             return bool(body[0]) and await self.another_inhibitor()
+        listed = await call(self.session_bus, *POWER, "GetInhibitors")
+        if listed and all(isinstance(app, str) for app in listed[0]):
+            return any(app != APP for app in listed[0])
         inhibited = await self.has_inhibit()
         if inhibited and self.held_at is not None:
             # right after we took ours, this is ours, however late it shows; were it
@@ -192,10 +198,7 @@ class Desktop:
         return False
 
     async def has_inhibit(self):
-        body = await call(
-            self.session_bus, "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement/Inhibit",
-            "org.freedesktop.PowerManagement.Inhibit", "HasInhibit",
-        )
+        body = await call(self.session_bus, *POWER, "HasInhibit")
         return bool(body and body[0])
 
     def holding(self, held):

@@ -16,7 +16,7 @@ describes how presenced tells the desktop you are there.
 - When you leave, `on_away` locks as before. The desktop's timers stay as a
   backstop if presenced stops or crashes.
 - It works on any desktop that offers the freedesktop idle inhibition
-  interface. Elsewhere presenced logs that once and carries on as before.
+  interface, and on Xfce's. Elsewhere presenced logs that once and carries on as before.
 
 ## How the desktop is told
 
@@ -244,23 +244,22 @@ Measured with `rig/run.sh`, which runs presenced's own `Keeper` and `Desktop` on
 a real desktop in a container. Each row a desktop has a value for is required of
 it, so a change fails the run, and a run that tested nothing does not pass:
 
-| | GNOME 50 | KDE (Fedora 44) | Xfce | sway |
+| | GNOME 50 | KDE (KWin 6.7) | Xfce 4.20 | sway 1.12 |
 |---|---|---|---|---|
-| `org.freedesktop.ScreenSaver` | yes | yes | no | no |
-| `Inhibit` works | yes | yes | no | no |
+| Idle inhibition | `org.freedesktop.ScreenSaver` | `org.freedesktop.ScreenSaver` | `org.xfce.ScreenSaver` and `PowerManagement`, one each | none |
 | `PowerManagement.HasInhibit` | no service | yes | yes | no service |
-| It shows our hold | n/a | yes, 5 s late or so | n/a | n/a |
-| Lists inhibitors by owner | yes | no | yes, unused | n/a |
+| It shows our hold | n/a | about 5 s late | at once | n/a |
+| Telling ours from a video | `GetInhibitors` | `MIXED_WITHIN_S` | `GetInhibitors` | n/a |
 | Input idle time | Mutter | refused | none | none |
-| `GetActive` | refused | works | n/a | n/a |
-| A release resets the idle time | yes | unmeasured, no idle time | n/a | n/a |
-| A dropped connection clears the hold | yes | yes | n/a | n/a |
+| `GetActive` | refused | works | works | n/a |
+| A release resets the idle time | yes | unmeasured, no idle time | unmeasured | n/a |
+| A dropped connection clears the hold | yes | yes | yes | n/a |
 
-KDE is the mixed case, so `MIXED_WITHIN_S` is doing real work there, and no
-MPRIS fallback is needed: `HasInhibit` is reliable enough once ours is told
-apart. Xfce has `org.xfce.ScreenSaver.Inhibit` instead, and `rig/run.sh xfce`
-fails until presenced uses it. The rig cannot show a lock happen, as headless
-Shell has no screen shield.
+KDE is the only mixed case, so that is where `MIXED_WITHIN_S` does real work, and
+the MPRIS fallback is not needed: `HasInhibit` is good enough once ours is told
+apart. Whether Xfce's two services really stop its lock and suspend is its own
+documentation's word, as the rig cannot show a lock happen, and neither can it on
+GNOME, as headless Shell has no screen shield.
 
 ## Decisions
 

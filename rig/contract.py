@@ -18,11 +18,9 @@ sys.path.insert(0, "/repo")
 from dbus_fast import BusType  # noqa: E402
 from dbus_fast.aio import MessageBus  # noqa: E402
 
-from presenced.desktop import GNOME_SESSION, MUTTER_IDLE, Desktop, call  # noqa: E402
-from presenced.keep import APP, SCREENSAVER, Keeper  # noqa: E402
+from presenced.desktop import GNOME_SESSION, MUTTER_IDLE, SAVERS, Desktop, call  # noqa: E402
+from presenced.keep import APP, POWER, SCREENSAVER, XFCE_SAVER, Keeper  # noqa: E402
 
-POWER = ("org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement/Inhibit",
-         "org.freedesktop.PowerManagement.Inhibit")
 LATE_S = 12.0  # how long to give a desktop to show a change
 UP_S = 90.0  # and to bring its services up
 
@@ -39,8 +37,9 @@ REQUIRED = {
         "power_service": True, "shows_ours": True, "drop_clears_hold": True,
     },
     "xfce": {
-        "up": [POWER[0], "org.xfce.ScreenSaver"], "version": ["dpkg-query", "-W", "xfce4-session"],
-        "inhibitor_taken": True, "drop_clears_hold": True,
+        "up": [POWER[0], XFCE_SAVER[0]], "version": ["dpkg-query", "-W", "xfce4-session"],
+        "inhibitor_taken": True, "holds": 2, "get_active_refused": False, "shows_ours": True,
+        "drop_clears_hold": True,
     },
     "sway": {
         "up": [], "version": ["sway", "--version"],
@@ -98,12 +97,12 @@ async def measure(required):
     await desktop.watch_input()
     facts["input_watch"] = desktop.armed_at is not None
     await desktop.saver_active()
-    facts["get_active_refused"] = desktop.saver_refused
+    facts["get_active_refused"] = len(desktop.silent_savers) == len(SAVERS)
     facts["inhibited_before"] = await desktop.idle_inhibited()
 
     keeper = Keeper(bus, 300.0)
     await keeper.want(True)
-    facts["inhibitor_taken"] = keeper.held
+    facts["inhibitor_taken"], facts["holds"] = keeper.held, len(keeper.holds)
     if not keeper.held:
         return facts
     desktop.holding(True)

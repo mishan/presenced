@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        desktop: [gnome, kde, sway]
+        desktop: [gnome, kde, xfce, sway]
     steps:
       - uses: actions/checkout@v5
       - run: rig/run.sh ${{ matrix.desktop }}

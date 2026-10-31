@@ -54,8 +54,8 @@ minutes, so the camera LED lights now and then, even while you are moving. Sonar
 motion alone never holds the desktop off, so with the camera blind or missing
 the desktop's timers run as usual, and they still apply if presenced stops. If
 you leave but something keeps moving, the desktop can take up to about ten
-minutes to lock. This needs `org.freedesktop.ScreenSaver.Inhibit`, which GNOME and KDE offer and
-Xfce and sway do not.
+minutes to lock. This works on GNOME, KDE and Xfce, each checked on a real session in a container;
+sway and other compositors with no idle inhibition on D-Bus go idle as usual.
 Set `keep_awake = false` under `[sensing]` to turn it off. An idle delay under
 about 40 seconds can run out before the first look.
 
