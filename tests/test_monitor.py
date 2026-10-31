@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from presenced.monitor import Monitor, State
@@ -381,3 +383,181 @@ def test_the_look_that_finds_someone_back_counts_toward_the_next():
     run_for(fake, mon, 9)
     assert mon.state is State.PRESENT
     assert fake.looks - looks == 1
+
+
+def keeping(look_every=120.0):
+    fake = Fake()
+    return fake, Monitor([fake.sonar, fake.camera], 30.0, 10.0, clock=fake.clock, look_every=look_every)
+
+
+def test_a_fidgeter_is_looked_at_soon_after_the_last_input_then_now_and_again():
+    fake, mon = keeping()
+    run_for(fake, mon, 29)
+    assert fake.looks == 0
+    run_for(fake, mon, 3)
+    assert fake.looks == 1
+    assert mon.attended
+    run_for(fake, mon, 117)
+    assert fake.looks == 1
+    run_for(fake, mon, 3)
+    assert fake.looks == 2
+
+
+def test_the_first_look_is_no_later_than_the_look_interval():
+    fake, mon = keeping(look_every=15.0)
+    run_for(fake, mon, 18)
+    assert fake.looks == 1
+
+
+def test_without_keeping_awake_motion_never_brings_a_look():
+    fake, mon = keeping(look_every=None)
+    run_for(fake, mon, 600)
+    assert fake.looks == 0
+    assert not mon.attended
+
+
+def test_without_keeping_awake_a_face_is_not_attended():
+    fake, mon = keeping(look_every=None)
+    fake.reading = QUIET
+    run_for(fake, mon, 36)
+    assert fake.looks == 1
+    assert not mon.attended
+
+
+@pytest.mark.parametrize("seen", [EMPTY, BLIND], ids=["empty", "blind"])
+def test_a_missed_forced_look_is_tried_once_more_and_does_not_lead_to_away(seen):
+    fake, mon = keeping()
+    fake.seen = seen
+    run_for(fake, mon, 33)
+    assert fake.looks == 1
+    assert mon.missed_at is None and mon.blind_at is None
+    run_for(fake, mon, 12)
+    assert fake.looks == 2
+    run_for(fake, mon, 100)
+    assert fake.looks == 2
+    assert mon.state is State.PRESENT
+    assert not mon.attended
+
+
+def test_motion_alone_never_counts_as_attended():
+    fake, mon = keeping()
+    fake.seen = EMPTY
+    run_for(fake, mon, 1200)
+    assert not mon.attended
+    assert mon.state is State.PRESENT
+
+
+def test_one_missed_look_keeps_attended_but_silence_of_the_camera_ends_it():
+    fake, mon = keeping()
+    run_for(fake, mon, 33)
+    sure = mon.sure_at
+    fake.seen = EMPTY
+    run_for(fake, mon, 135)
+    assert mon.attended
+    fake.now = sure + 310.0
+    assert not mon.attended
+
+
+def test_a_look_in_the_quiet_path_counts():
+    fake, mon = monitor()
+    mon.look_every = 120.0
+    fake.reading = QUIET
+    run_for(fake, mon, 36)
+    assert mon.attended
+
+
+def test_a_look_that_brings_the_user_back_counts():
+    fake, mon = keeping()
+    mon.state = State.AWAY
+    fake.reading, fake.seen = QUIET, EMPTY
+    run_for(fake, mon, 6)
+    fake.reading, fake.seen = MOVING, FACE
+    run_for(fake, mon, 3)
+    assert mon.state is State.PRESENT
+    assert mon.attended
+
+
+def test_going_away_ends_attended():
+    fake, mon = keeping()
+    run_for(fake, mon, 33)
+    fake.reading, fake.seen = QUIET, EMPTY
+    run_for(fake, mon, 60)
+    assert mon.state is State.AWAY
+    assert not mon.attended
+
+
+def test_a_restart_or_a_hold_ends_attended():
+    fake, mon = keeping()
+    run_for(fake, mon, 33)
+    assert mon.attended
+    mon.freeze()
+    assert not mon.attended
+    mon.hold.clear()
+    assert mon.attended
+    mon.restart()
+    assert not mon.attended
+
+
+def test_no_camera_is_never_attended_and_never_looks():
+    fake = Fake()
+    mon = Monitor([fake.sonar], 30.0, 10.0, clock=fake.clock, look_every=120.0)
+    run_for(fake, mon, 600)
+    assert not mon.attended
+
+
+def test_attended_always_rests_on_a_recent_face():
+    rng = random.Random(7)
+    for _ in range(300):
+        fake, mon = keeping()
+        faces = []
+        for _ in range(300):
+            fake.reading = rng.choice([MOVING, QUIET, MOVING, MUTED])
+            fake.seen = rng.choice([FACE, EMPTY, EMPTY, BLIND])
+            looks = fake.looks
+            mon.step()
+            if fake.looks > looks and fake.seen is FACE:
+                faces.append(fake.now)
+            if rng.random() < 0.02:
+                mon.active()
+                faces.clear()
+            fake.now += INTERVAL
+            if mon.attended:
+                assert mon.state is State.PRESENT
+                assert faces and fake.now - faces[-1] < 310.0
+
+
+@pytest.mark.parametrize("left_at", [150.0, 153.0], ids=["as a forced look comes due", "after a forced look"])
+def test_keeping_awake_barely_slows_a_sensor_that_says_nobody_is_here(left_at):
+    def away_after_leaving(look_every):
+        fake, mon = keeping(look_every)
+        run_for(fake, mon, left_at)
+        fake.reading, fake.seen = GONE, EMPTY
+        return run_for(fake, mon, 90) - left_at
+
+    assert away_after_leaving(120.0) <= away_after_leaving(None) + 10.0
+
+
+def test_a_quiet_look_overrides_a_pending_retry():
+    fake, mon = keeping()
+    run_for(fake, mon, 6)
+    fake.reading, fake.seen = QUIET, EMPTY
+    run_for(fake, mon, 27)  # sonar quiet since 6; the forced look at 30 misses
+    fake.seen = FACE
+    run_for(fake, mon, 6)  # quiet long enough at 36 for the quiet path to look
+    assert mon.retry_at is None
+
+
+def test_a_retry_does_not_let_attended_lapse_before_the_next_look():
+    fake = Fake()
+    mon = Monitor([fake.sonar, fake.camera], 30.0, 30.0, clock=fake.clock, look_every=10.0)
+    run_for(fake, mon, 15)
+    assert mon.attended
+    fake.seen = EMPTY
+    run_for(fake, mon, 12)  # the forced look misses; its retry is 30 s off
+    fake.seen = FACE
+    attended = []
+    for _ in range(14):
+        attended.append(mon.attended)
+        mon.step()
+        fake.now += INTERVAL
+    assert all(attended)

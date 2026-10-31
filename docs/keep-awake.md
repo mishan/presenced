@@ -45,16 +45,18 @@ Reasons for inhibiting rather than resetting the idle time:
 
 ## Deciding when: the monitor
 
-`Monitor` gains `look_every` (seconds, or `None` when keep-awake is off) and two
+`Monitor` gains `look_every` (seconds, or `None` when keep-awake is off), and two
 fields:
 
 - `sure_at`: when a look last found a face, `None` if not since the last restart.
+  Unlike `seen_at` it counts forced looks, which must not arm the guard that
+  keeps a flickering proximity sensor off the camera, or they would delay away.
 - `since`: when the current run began, set by `restart()`.
 
 `restart()` clears `sure_at`. Input calls `active()` and so `restart()`, which
-is fine: GNOME is not idle while you type, and the first look comes
-`look_every` after the last input. It also covers resume from suspend, where
-the monotonic clock stood still and `sure_at` would otherwise look fresh.
+is fine: GNOME is not idle while you type, and the first look comes soon after
+the last input. It also covers resume from suspend, where the monotonic clock
+stood still and `sure_at` would otherwise look fresh.
 
 **Forced looks.** Today the camera is asked only after `quiet_for` of quiet
 sonar, so someone fidgeting is never looked at. In `step_present`, when sonar
@@ -63,20 +65,21 @@ has not been quiet for `quiet_for`, take a look once `now` is `look_every` past
 a run. The early first look starts the hold within about 40 s of the last
 input, in time for GNOME's shortest delay of one minute:
 
-- a face sets `sure_at` and `seen_at`;
+- a face sets `sure_at`;
 - no face, or a blind camera, schedules one retry after `recheck_after`, then
   the normal cadence, so a turned head does not cost two minutes. A forced miss
   does not set `missed_at`: the sonar saw motion, and two misses must still
   follow a quiet run before the user counts as away.
 
-Looks in the existing quiet path set `sure_at` too. `step_away` sets it after
-`switch()`, as it does `seen_at`, because the switch runs `restart()`.
+Looks in the existing quiet path set `sure_at` too, and `step_away` sets it after
+`switch()`, because the switch runs `restart()`. A poll sensor saying nobody is
+here skips forced looks, and a quiet-path look cancels a pending retry.
 
 **The verdict.** `Monitor.attended`:
 
-    state is PRESENT, not held, and sure_at is within KEEP_FOR
+    not held, and sure_at is within KEEP_FOR (a switch to away clears it)
 
-`KEEP_FOR` is `2.5 * look_every`, 300 s by default, so one missed look (a
+`KEEP_FOR` is `2.5 * look_every + recheck_after`, 310 s by default, so one missed look (a
 turned head) does not drop the hold. If you leave while the sonar keeps seeing
 motion, the hold lapses within five minutes of the last face, and GNOME then
 counts a full idle delay from there (see below).
@@ -95,6 +98,10 @@ counts a full idle delay from there (see below).
 is `sensing` or `input`: `watching` (locked), `paused`, `inhibited` and `locked`
 all release. `locked()` also asks `org.freedesktop.ScreenSaver.GetActive`, since
 a compositor may never set logind's `LockedHint`.
+
+`attended` is false during any hold and `release()` runs `restart()`, so the
+daemon cannot just follow it here: it keeps the hold through `held` itself, and
+leaving a hold has to make the next look due at once rather than after `since`.
 
 `held` (another program's inhibitor, such as a video) keeps our hold as it is.
 On a desktop that does not restart its idle count, releasing would lock at once

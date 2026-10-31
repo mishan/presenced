@@ -17,6 +17,7 @@ from .sensor import Reading, Verdict
 log = logging.getLogger("presenced")
 
 BLIND_PATIENCE = 3  # with the look sensors blind, wait this many times longer on the poll sensors alone
+KEEP_LOOKS = 2.5  # a face counts for this many look intervals and a retry, so one missed look does not end it
 BLIND = Reading(Verdict.UNKNOWN)
 
 
@@ -26,12 +27,13 @@ class State(enum.Enum):
 
 
 class Monitor:
-    def __init__(self, sensors, quiet_for, recheck_after, on_change=None, clock=time.monotonic):
+    def __init__(self, sensors, quiet_for, recheck_after, on_change=None, clock=time.monotonic, look_every=None):
         self.sensors = sensors
         self.polls = [sensor for sensor in sensors if sensor.role == "poll"]
         self.looks = [sensor for sensor in sensors if sensor.role == "look"]
         self.quiet_for = quiet_for
         self.recheck_after = recheck_after
+        self.look_every = look_every  # least time between looks while there is motion; None: only when quiet
         self.on_change = on_change
         self.clock = clock
         self.state = State.PRESENT
@@ -40,6 +42,9 @@ class Monitor:
         self.looked_at = None  # when the look sensors were last asked
         self.blind_at = None  # when the look sensors last saw nothing at all
         self.seen_at = None  # when a look last found someone in this run
+        self.sure_at = None  # the same, counting the forced looks, which must not keep other sensors from deciding
+        self.since = clock()  # when this run began
+        self.retry_at = None  # when to try again after a forced look missed
         self.absent_since = None  # start of an unbroken run of poll sensors saying nobody is here
         self.away_wait = recheck_after  # least time between looks for motion while away; grows with misses
         self.readings = {}  # the latest reading of each sensor, by name
@@ -55,6 +60,17 @@ class Monitor:
     def quiet_seconds(self):
         since = self.quiet_since  # once: a step in the sensing thread may clear it meanwhile
         return 0.0 if since is None else self.clock() - since
+
+    @property
+    def attended(self):
+        """Whether a face was seen lately, the only thing that may hold the desktop off idling."""
+        sure = self.sure_at  # once: a step in the sensing thread may clear it meanwhile
+        return (
+            self.look_every is not None
+            and not self.hold.is_set()
+            and sure is not None
+            and self.clock() - sure < KEEP_LOOKS * self.look_every + self.recheck_after
+        )
 
     def freeze(self):
         with self.gate:
@@ -82,6 +98,9 @@ class Monitor:
         self.looked_at = None
         self.blind_at = None
         self.seen_at = None
+        self.sure_at = None
+        self.since = self.clock()
+        self.retry_at = None
         self.absent_since = None
         self.away_wait = self.recheck_after
 
@@ -137,8 +156,30 @@ class Monitor:
         else:
             self.step_away(now, quiet_s, moving, usable)
 
+    def look_due(self, now):
+        if self.look_every is None or not self.looks:
+            return False
+        if self.retry_at is not None:
+            return now >= self.retry_at
+        if self.looked_at is None:
+            return now - self.since >= min(self.quiet_for, self.look_every)
+        return now - self.looked_at >= self.look_every
+
+    def forced_look(self, now):
+        """Ask whether the face is still there, though the poll sensors are not quiet."""
+        retry = self.retry_at is None
+        self.retry_at = None
+        self.looked_at = now
+        if self.look().verdict is Verdict.PRESENT:
+            self.sure_at = now
+        elif retry:  # a turned head should not cost a whole interval, but an empty desk is not stared at
+            self.retry_at = now + self.recheck_after
+
     def step_present(self, now, quiet_s, usable, absent):
         if quiet_s < self.quiet_for:
+            if not absent and self.look_due(now):
+                self.forced_look(now)
+                return
             # a poll sensor that says nobody is here skips the wait, but one that
             # flickers (someone at the edge of its range) must not blink the camera:
             # not within recheck_after of the last look, nor within quiet_for of one
@@ -163,6 +204,7 @@ class Monitor:
         if self.missed_at is not None and now - self.missed_at < self.recheck_after:
             return
         self.looked_at = now
+        self.retry_at = None
         seen = self.look().verdict
         if seen is Verdict.UNKNOWN:
             self.blind_at = now
@@ -174,7 +216,7 @@ class Monitor:
             # sitting still: wait out another full quiet period before looking again
             self.quiet_since = now
             self.missed_at = None
-            self.seen_at = now
+            self.seen_at = self.sure_at = now
         elif self.missed_at is None:
             self.missed_at = now
         else:
@@ -200,7 +242,7 @@ class Monitor:
             # the switch forgets this run; keep this look, so the next waits its turn
             self.looked_at = now
             if seen is Verdict.PRESENT:
-                self.seen_at = now
+                self.seen_at = self.sure_at = now
         elif moving:
             # double the wait up to quiet_for, but never below recheck_after
             self.away_wait = max(self.away_wait, min(2 * self.away_wait, self.quiet_for))
