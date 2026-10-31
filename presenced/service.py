@@ -41,6 +41,7 @@ FAILING_FOR_S = 60.0  # how long ticks may keep failing before presenced exits f
 EXIT_CONFIG = 2  # a bad configuration: restarting will not help
 EXIT_TAKEN = 3  # another presenced owns the bus name: restarting will not help either
 ACTION_TIMEOUT_S = 60.0  # an action still running after this long is killed
+IDLE_RESET_SLACK_S = 1.0  # input this soon after the desktop restarted its idle count is put down to the restart
 
 
 class PresenceInterface(ServiceInterface):
@@ -134,6 +135,8 @@ class Daemon:
         self.failing_since = None
         self.exit_code = 0
         self.clock = time.monotonic
+        self.was_inhibited = False
+        self.idle_reset_at = None  # when the desktop last restarted its idle count by itself
         self.monitor = monitor or Monitor(
             make_sensors(config), config.sensing.quiet_for, config.sensing.recheck_after
         )
@@ -332,7 +335,17 @@ class Daemon:
             # below can hold the state, or it would be lost
             self.monitor.active()
 
-        if not locked and self.config.sensing.respect_idle_inhibitors and await self.desktop.idle_inhibited():
+        must_know = self.config.sensing.respect_idle_inhibitors and not locked
+        try:
+            inhibited = await self.desktop.idle_inhibited()
+        except TimeoutError:
+            if must_know:
+                raise
+            inhibited = self.was_inhibited
+        if self.was_inhibited and not inhibited:
+            self.idle_reset_at = self.clock()
+        self.was_inhibited = inhibited
+        if inhibited and must_know:
             # a video is playing, say: the desktop will not blank or lock, and neither should we
             self.hold("held")
             return
@@ -342,7 +355,7 @@ class Daemon:
             return
 
         self.idle_seconds = await self.desktop.idle_seconds()
-        if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
+        if self.recent_input():
             self.set_mode("input")
             self.monitor.active()
             return
@@ -357,6 +370,16 @@ class Daemon:
         ):
             log.info("someone came back: waking the screen")
             await self.waker.wake()
+
+    def recent_input(self):
+        """Whether the idle time means someone touched the laptop, not that an idle inhibitor ended.
+
+        Mutter restarts its idle count when the last inhibitor goes, without any input.
+        """
+        idle = self.idle_seconds
+        if idle is None or idle >= self.config.sensing.start_after_idle:
+            return False
+        return self.idle_reset_at is None or self.clock() - idle > self.idle_reset_at + IDLE_RESET_SLACK_S
 
     async def safe_tick(self):
         """A tick that logs what went wrong instead of ending the daemon, unless it keeps failing."""

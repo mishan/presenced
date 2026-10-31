@@ -486,3 +486,71 @@ def test_status_shows_each_sensor(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Sonar:    quiet (level_db -24.00, usable True), fake\n" in out
     assert "Camera:   not read yet, fake\n" in out
+
+
+@pytest.mark.parametrize("respect", [True, False])
+def test_an_inhibitor_ending_is_not_input(respect):
+    # Mutter restarts its idle count when the last idle inhibitor goes
+    d, monitor, _ = daemon(locked=False)
+    d.config.sensing.respect_idle_inhibitors = respect
+    d.desktop.inhibited = True
+    tick(d)
+    d.desktop.inhibited = False
+    d.desktop.idle = 0.7
+    tick(d)
+    assert monitor.state is State.AWAY
+    assert d.mode == "sensing"
+
+
+def test_input_after_an_inhibitor_ended_still_counts():
+    now = [100.0]
+    d, monitor, _ = daemon(locked=False)
+    d.clock = lambda: now[0]
+    d.desktop.inhibited = True
+    tick(d)
+    d.desktop.inhibited = False
+    tick(d)
+    now[0] += 5.0
+    d.desktop.idle = 0.5
+    tick(d)
+    assert monitor.state is State.PRESENT
+    assert d.mode == "input"
+
+
+def test_an_inhibitor_ending_behind_the_lock_screen_is_not_input():
+    d, monitor, _ = daemon(locked=True)
+    d.desktop.inhibited = True
+    tick(d)
+    d.desktop.inhibited = False
+    d.desktop.idle = 0.7
+    tick(d)
+    assert monitor.state is State.AWAY
+
+
+def test_an_idle_time_dating_from_the_reset_is_not_input():
+    now = [100.0]
+    d, monitor, _ = daemon(locked=False)
+    d.clock = lambda: now[0]
+    d.desktop.inhibited = True
+    tick(d)
+    d.desktop.inhibited = False
+    tick(d)
+    now[0] += 3.0
+    d.desktop.idle = 3.7
+    tick(d)
+    assert monitor.state is State.AWAY
+
+
+@pytest.mark.parametrize(
+    "locked, respect", [(True, True), (True, False), (False, False)]
+)
+def test_a_hung_session_manager_only_matters_when_its_answer_is_needed(locked, respect):
+    d, monitor, _ = daemon(locked=locked)
+    d.config.sensing.respect_idle_inhibitors = respect
+
+    async def hung():
+        raise TimeoutError
+
+    d.desktop.idle_inhibited = hung
+    tick(d)
+    assert monitor.steps == 1
