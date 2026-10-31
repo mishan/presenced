@@ -168,7 +168,9 @@ the idle delay to lock, ten minutes by default. A quiet departure still ends in
 
 1. GNOME: `GetInhibitors`, then each one's `GetAppId` and `GetFlags`; true if
    any has the idle flag and is not `presenced`.
-2. Elsewhere: `HasInhibit` on `org.freedesktop.PowerManagement.Inhibit`. With
+2. KDE: `ListInhibitions` on its PolicyAgent, and Xfce: `GetInhibitors` on
+   `org.freedesktop.PowerManagement.Inhibit`. Both name the owner.
+3. Elsewhere: `HasInhibit` on that interface. With
    `respect_idle_inhibitors` on, a true answer means `held`, so no hold starts
    during a video. During a hold, a true answer within `MIXED_WITHIN_S` (10 s) of
    taking it is ours, however late it shows, and from then on `HasInhibit` is
@@ -242,24 +244,32 @@ stretches. `keep_awake_every` has a minimum of 10.
 
 Measured with `rig/run.sh`, which runs presenced's own `Keeper` and `Desktop` on
 a real desktop in a container. Each row a desktop has a value for is required of
-it, so a change fails the run, and a run that tested nothing does not pass:
+it unless noted below, so a change fails the run, and a run that tested nothing
+does not pass:
 
 | | GNOME 50 | KDE (KWin 6.7) | Xfce 4.20 | sway 1.12 |
 |---|---|---|---|---|
 | Idle inhibition | `org.freedesktop.ScreenSaver` | `org.freedesktop.ScreenSaver` | `org.xfce.ScreenSaver` and `PowerManagement`, one each | none |
 | `PowerManagement.HasInhibit` | no service | yes | yes | no service |
 | It shows our hold | n/a | about 5 s late | at once | n/a |
-| Telling ours from a video | `GetInhibitors` | `MIXED_WITHIN_S` | `GetInhibitors` | n/a |
+| Telling ours from a video | `GetInhibitors` | `ListInhibitions` | `GetInhibitors` | n/a |
 | Input idle time | Mutter | refused | none | none |
 | `GetActive` | refused | works | works | n/a |
 | A release resets the idle time | yes | unmeasured, no idle time | unmeasured | n/a |
 | A dropped connection clears the hold | yes | yes | yes | n/a |
 
-KDE is the only mixed case, so that is where `MIXED_WITHIN_S` does real work, and
-the MPRIS fallback is not needed: `HasInhibit` is good enough once ours is told
-apart. Whether Xfce's two services really stop its lock and suspend is its own
-documentation's word, as the rig cannot show a lock happen, and neither can it on
-GNOME, as headless Shell has no screen shield.
+Which call tells a video from ours is shown by the scenarios below, not by the
+contract. No desktop here depends on `HasInhibit` alone, so the MPRIS fallback is not
+needed; `MIXED_WITHIN_S` stays for one that would.
+
+`rig/run.sh DESKTOP stay|leave` runs the whole daemon, with the sensors scripted,
+on GNOME, KDE and Xfce, each with its idle lock set short: sitting still does not
+lock, a video comes and goes, motion alone lets the desktop's own lock return, and
+leaving locks through `on_away` and stays away. GNOME also gets real pointer input
+through Mutter's RemoteDesktop. GNOME Shell only offers a lock if it finds GDM on
+the system bus, so `rig/standins/gdm.py` stands in. Xfce sets no `LockedHint`, so
+there only `GetActive` shows a lock. Containers cannot suspend, so that remains to
+be shown.
 
 ## Decisions
 

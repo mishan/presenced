@@ -309,3 +309,30 @@ def test_an_inhibitor_list_of_another_shape_falls_back_to_has_inhibit(reply):
 
     bus.call = odd
     assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is False
+
+
+@pytest.mark.parametrize(
+    "inhibitions, expected",
+    [([], False), ([["presenced", "us"]], False), ([["presenced", "us"], ["firefox", "video"]], True)],
+    ids=["none", "only ours", "ours and a video"],
+)
+def test_kde_is_told_by_who_holds_each_inhibition_even_with_has_inhibit_true(inhibitions, expected):
+    bus = SessionBus(has_inhibit=True)
+    real = bus.call
+
+    async def kde(message):
+        return Reply([inhibitions]) if message.member == "ListInhibitions" else await real(message)
+
+    bus.call = kde
+    assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is expected
+
+
+def test_an_inhibition_list_of_another_shape_falls_back_to_has_inhibit():
+    bus = SessionBus(has_inhibit=False)
+    real = bus.call
+
+    async def odd(message):
+        return Reply([["firefox"]]) if message.member == "ListInhibitions" else await real(message)
+
+    bus.call = odd
+    assert asyncio.run(desktop.Desktop(bus, SilentBus()).idle_inhibited()) is False

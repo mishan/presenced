@@ -2,6 +2,10 @@
 # A headless Plasma: KWin on a virtual output, with the session's services on it.
 export XDG_CURRENT_DESKTOP=KDE KDE_SESSION_VERSION=6 KDE_FULL_SESSION=true
 export QT_QPA_PLATFORM=wayland WAYLAND_DISPLAY=wayland-rig
+if [ -n "${LOCK_AFTER_S:-}" ]; then
+    mkdir -p ~/.config
+    printf '[Daemon]\nAutolock=true\nTimeout=%d\n' "$((LOCK_AFTER_S / 60))" > ~/.config/kscreenlockerrc
+fi
 kwin_wayland --virtual --socket "$WAYLAND_DISPLAY" --width 1280 --height 720 >/tmp/session.log 2>&1 &
 sleep 5
 ksmserver >>/tmp/session.log 2>&1 &

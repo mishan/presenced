@@ -28,6 +28,7 @@ CALL_TIMEOUT_S = 5.0
 SAVERS = ((SCREENSAVER, "/org/freedesktop/ScreenSaver", SCREENSAVER), XFCE_SAVER)
 MIXED_WITHIN_S = 10.0  # HasInhibit shows our own inhibitor by this long after we take it, if at all
 GNOME_SESSION = ("org.gnome.SessionManager", "/org/gnome/SessionManager")
+KDE_POLICY = ("org.kde.Solid.PowerManagement.PolicyAgent", "/org/kde/Solid/PowerManagement/PolicyAgent")
 GNOME_INHIBIT_IDLE = 8  # the "don't go idle" flag of GNOME's session manager inhibitors
 
 
@@ -174,6 +175,9 @@ class Desktop:
         body = await call(self.session_bus, *GNOME_SESSION, GNOME_SESSION[0], "IsInhibited", "u", (GNOME_INHIBIT_IDLE,))
         if body is not None:
             return bool(body[0]) and await self.another_inhibitor()
+        held = await call(self.session_bus, *KDE_POLICY, KDE_POLICY[0], "ListInhibitions")
+        if held and all(isinstance(entry, list) and len(entry) == 2 for entry in held[0]):
+            return any(app != APP for app, _ in held[0])
         listed = await call(self.session_bus, *POWER, "GetInhibitors")
         if listed and all(isinstance(app, str) for app in listed[0]):
             return any(app != APP for app in listed[0])
