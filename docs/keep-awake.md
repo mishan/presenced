@@ -285,6 +285,10 @@ presenced, and is covered only by real laptops. So is everything
 physical: whether the emitter reaches a face in a real room, and how ultrasound
 really comes back.
 
+`rig/mutants.py` breaks a copy of the code in specific ways and requires the check
+named for each to go red, since a check that cannot fail has passed here before.
+A new check should get a row there.
+
 ## Decisions
 
 - Inhibit, not simulated activity or a nudge (see above).

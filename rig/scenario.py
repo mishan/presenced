@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 
@@ -113,6 +114,21 @@ class Scenario:
     async def held(self):
         return self.daemon.keeper is not None and self.daemon.keeper.held
 
+    async def video_with_no_hold(self):
+        # with our hold in place a video is not the last inhibitor, so its end restarts nothing
+        self.camera.verdict = Verdict.ABSENT
+        other = await MessageBus(bus_type=BusType.SESSION).connect()
+        target = VIDEO[self.desktop]
+        cookie = (await call(other, *target, "Inhibit", "ss", ("firefox", "video")))[0]
+        await self.within(15, self.playing)
+        self.modes.clear()
+        await call(other, *target, "UnInhibit", "u", (cookie,))
+        await self.within(15, self.not_playing)
+        await asyncio.sleep(3)
+        self.check("a video ending is not read as input", "input" not in self.modes, modes=self.modes[:6])
+        other.disconnect()
+        self.camera.verdict = Verdict.PRESENT
+
     async def video(self):
         other = await MessageBus(bus_type=BusType.SESSION).connect()
         target = VIDEO[self.desktop]
@@ -120,12 +136,10 @@ class Scenario:
         seen = await self.within(15, self.playing)
         self.check("a video is noticed", seen is not None)
         self.check("a video leaves the hold in place", await self.held())
-        self.modes.clear()
         await call(other, *target, "UnInhibit", "u", (cookie,))
         over = await self.within(15, self.not_playing)
         await asyncio.sleep(3)
         self.check("a video ending is noticed", over is not None)
-        self.check("a video ending is not read as input", "input" not in self.modes, modes=self.modes[:6])
         self.check("the hold survives a video ending", await self.held() and not await self.locked())
         other.disconnect()
 
@@ -202,6 +216,11 @@ class Scenario:
 
     async def idle_action(self):
         self.bus = await MessageBus(bus_type=BusType.SESSION).connect()
+        actions = [subprocess.run(
+            ["gsettings", "get", "org.gnome.settings-daemon.plugins.power", f"sleep-inactive-{power}-type"],
+            capture_output=True, text=True,
+        ).stdout.strip() for power in ("ac", "battery")]
+        self.check("gsd-power's idle action is logging out", actions == ["'logout'", "'logout'"], actions=actions)
         await self.take()
         await asyncio.sleep(IDLE_ACTION_S + 25)
         self.check("a hold keeps gsd-power's idle action off", await self.session_there() == [True])
@@ -218,6 +237,7 @@ class Scenario:
         elif name == "idle":
             await self.idle_action()
         elif name == "stay":
+            await self.video_with_no_hold()
             await self.take()
             await self.sit()
             await self.video()

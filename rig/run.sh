@@ -13,7 +13,7 @@ set -eu
 desktop=$1
 check=${2:-contract}
 rig=$(cd "$(dirname "$0")" && pwd)
-repo=$(dirname "$rig")
+repo=${PRESENCED_SRC:-$(dirname "$rig")}
 image=presenced-rig-$desktop
 name=$image-$$
 type=wayland

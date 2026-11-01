@@ -2,7 +2,8 @@
 
 Status: the sensor interface, the monitor's rules, per-sensor status and the
 laptop presence sensor (`presenced/proximity.py`) are implemented. `Report`,
-command sensors, Bluetooth and the open questions are still proposals.
+command sensors, Bluetooth and the open questions are still proposals. A face also
+holds the desktop's idle timers off; see [keep-awake.md](keep-awake.md).
 
 presenced started with two sensors, the sonar and the IR camera, which
 `Monitor` took by name. This describes a common interface so that other ways
