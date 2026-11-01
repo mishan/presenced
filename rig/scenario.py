@@ -212,7 +212,10 @@ class Scenario:
                           "NameHasOwner", "s", ("org.gnome.SessionManager",))
 
     async def session_gone(self):
-        return await self.session_there() == [False]
+        try:
+            return await self.session_there() == [False]
+        except (EOFError, OSError, TimeoutError):  # logging out can take the session bus with it
+            return True
 
     async def idle_action(self):
         self.bus = await MessageBus(bus_type=BusType.SESSION).connect()
@@ -236,6 +239,8 @@ class Scenario:
             await self.sensed()
         elif name == "idle":
             await self.idle_action()
+            task.cancel()  # its bus may be gone, so it cannot stop in the usual way
+            return
         elif name == "stay":
             await self.video_with_no_hold()
             await self.take()
