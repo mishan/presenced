@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 
 from .config import data_home
+from .sensor import Reading, Verdict
 
 # YuNet, from OpenCV's model zoo (MIT license), pinned to a commit and checked
 MODEL_NAME = "face_detection_yunet_2023mar.onnx"
@@ -123,6 +124,9 @@ def roi_control(x, y, w, h):
 
 
 class IRCamera:
+    name = "camera"
+    role = "look"
+
     def __init__(self, device="", score_threshold=0.5, min_face_width=0.08):
         self.device, self.width, self.height = find_camera(device)
         self.abort = threading.Event()  # set to cut a look short and free the camera
@@ -141,6 +145,24 @@ class IRCamera:
         self.metering = subprocess.run(
             ["v4l2-ctl", "-d", self.device, "--list-ctrls"], capture_output=True, text=True, timeout=10
         ).stdout.count("region_of_interest_rectangle") > 0
+
+    def hold(self):
+        with self.gate:
+            self.abort.set()
+
+    def release(self):
+        self.abort.clear()
+
+    def describe(self):
+        return self.device
+
+    def read(self):
+        seen = self.look()
+        if seen.blind:
+            verdict = Verdict.UNKNOWN
+        else:
+            verdict = Verdict.PRESENT if seen.faces else Verdict.ABSENT
+        return Reading(verdict, {"faces": seen.faces, "score": seen.score, "near_pct": seen.near_pct})
 
     def default_roi(self):
         """Where a face at a laptop usually is."""
@@ -245,17 +267,3 @@ class IRCamera:
             self.roi = self.default_roi()  # the face may come back somewhere else
         return IRReading(best_faces, best_score, near_pct, False)
 
-
-class NoCamera:
-    """Stands in when the camera is turned off or missing: always blind."""
-
-    device = "disabled"
-
-    def __init__(self):
-        self.abort = threading.Event()
-        self.idle = threading.Event()
-        self.idle.set()
-        self.gate = threading.Lock()
-
-    def look(self):
-        return IRReading(0, 0.0, 0.0, True)

@@ -1,14 +1,23 @@
-from presenced.ir import IRReading
+import random
+
+import pytest
+
 from presenced.monitor import Monitor, State
-from presenced.sonar import SonarReading
+from presenced.sensor import Reading, Verdict
 
 INTERVAL = 3.0
-MOVING = SonarReading(-24.0, -15.0)
-QUIET = SonarReading(-24.0, -33.0)
-MUTED = SonarReading(-120.0, 0.0)
-FACE = IRReading(1, 0.9, 20.0, False)
-EMPTY = IRReading(0, 0.0, 20.0, False)
-BLIND = IRReading(0, 0.0, 0.0, True)
+MOVING = Reading(Verdict.PRESENT)
+QUIET = Reading(Verdict.QUIET)
+MUTED = Reading(Verdict.UNKNOWN)
+GONE = Reading(Verdict.ABSENT)
+FACE = Reading(Verdict.PRESENT)
+EMPTY = Reading(Verdict.ABSENT)
+BLIND = Reading(Verdict.UNKNOWN)
+
+
+class Sensor:
+    def __init__(self, name, role, read):
+        self.name, self.role, self.read = name, role, read
 
 
 class Fake:
@@ -19,9 +28,8 @@ class Fake:
         self.reading = MOVING
         self.seen = FACE
         self.looks = 0
-
-    def probe(self):
-        return self.reading
+        self.sonar = Sensor("sonar", "poll", lambda: self.reading)
+        self.camera = Sensor("camera", "look", self.look)
 
     def look(self):
         self.looks += 1
@@ -33,7 +41,7 @@ class Fake:
 
 def monitor():
     fake = Fake()
-    return fake, Monitor(fake, fake, -28.0, 30.0, 10.0, clock=fake.clock)
+    return fake, Monitor([fake.sonar, fake.camera], 30.0, 10.0, clock=fake.clock)
 
 
 def run_for(fake, mon, seconds):
@@ -159,22 +167,18 @@ def test_changes_are_reported_once_each():
 
 
 def test_camera_alone_decides_when_sonar_is_off():
-    from presenced.sonar import NoSonar
-
     fake, _ = monitor()
     fake.seen = EMPTY
-    mon = Monitor(NoSonar(), fake, -28.0, 30.0, 10.0, clock=fake.clock)
+    mon = Monitor([fake.camera], 30.0, 10.0, clock=fake.clock)
     changed_at = run_for(fake, mon, 120)
     assert mon.state is State.AWAY
     assert 40 <= changed_at <= 45
 
 
 def test_sonar_alone_decides_when_camera_is_off():
-    from presenced.ir import NoCamera
-
     fake, _ = monitor()
     fake.reading = QUIET
-    mon = Monitor(fake, NoCamera(), -28.0, 30.0, 10.0, clock=fake.clock)
+    mon = Monitor([fake.sonar], 30.0, 10.0, clock=fake.clock)
     changed_at = run_for(fake, mon, 150)
     assert mon.state is State.AWAY
     assert 90 <= changed_at <= 95
@@ -218,13 +222,368 @@ def test_a_hold_set_during_the_probe_keeps_the_camera_shut():
     fake.seen = EMPTY
     run_for(fake, mon, 30)
     looks = fake.looks
-    original = fake.probe
 
     def probe_then_pause():
         mon.freeze()
-        return original()
+        return fake.reading
 
-    fake.probe = probe_then_pause
+    fake.sonar.read = probe_then_pause
     run_for(fake, mon, 30)
     assert fake.looks == looks
     assert mon.state is State.PRESENT
+
+
+def gone_sensor():
+    return Sensor("proximity", "poll", lambda: GONE)
+
+
+def test_a_poll_sensor_saying_nobody_is_here_skips_the_quiet_wait():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    mon = Monitor([gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    changed_at = run_for(fake, mon, 60)
+    assert mon.state is State.AWAY
+    assert changed_at <= 12
+    assert fake.looks == 2
+
+
+def test_with_nothing_to_look_a_lasting_absence_decides():
+    fake, _ = monitor()
+    mon = Monitor([gone_sensor()], 30.0, 10.0, clock=fake.clock)
+    assert 10 <= run_for(fake, mon, 30) <= 12
+
+
+def test_with_nothing_to_look_one_absent_reading_is_not_enough():
+    # a presence sensor that times out reads 0, which looks like nobody there
+    fake, _ = monitor()
+    readings = iter([GONE])
+    mon = Monitor([Sensor("proximity", "poll", lambda: next(readings, QUIET))], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 60)
+    assert mon.state is State.PRESENT
+
+
+def test_motion_beats_a_poll_sensor_saying_nobody_is_here():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    mon = Monitor([fake.sonar, gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 120)
+    assert mon.state is State.PRESENT
+    assert fake.looks == 0
+
+
+def test_a_face_overruling_a_poll_sensor_is_not_watched_constantly():
+    fake, _ = monitor()
+    mon = Monitor([gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 300)
+    assert mon.state is State.PRESENT
+    assert fake.looks <= 300 / 30 + 1
+
+
+@pytest.mark.parametrize(
+    "seen, verdict",
+    [
+        ((FACE, EMPTY), Verdict.PRESENT),
+        ((EMPTY, FACE), Verdict.PRESENT),
+        ((BLIND, EMPTY), Verdict.ABSENT),
+        ((BLIND, BLIND), Verdict.UNKNOWN),
+        ((), Verdict.UNKNOWN),
+    ],
+)
+def test_any_face_wins_and_any_clear_look_beats_a_blind_one(seen, verdict):
+    looks = [Sensor(f"look{i}", "look", lambda r=r: r) for i, r in enumerate(seen)]
+    mon = Monitor(looks, 30.0, 10.0)
+    assert mon.look().verdict is verdict
+
+
+def test_a_hold_between_look_sensors_stops_the_rest():
+    fake, _ = monitor()
+
+    def look_then_pause():
+        mon.freeze()
+        return EMPTY
+
+    mon = Monitor([Sensor("first", "look", look_then_pause), fake.camera], 30.0, 10.0, clock=fake.clock)
+    mon.look()
+    assert fake.looks == 0
+
+
+def test_a_blind_camera_and_a_poll_sensor_saying_nobody_is_here_go_away():
+    # the shutter is closed, then the presence sensor sees the user get up
+    fake, _ = monitor()
+    fake.reading = QUIET
+    fake.seen = BLIND
+    proximity = Sensor("proximity", "poll", lambda: QUIET)
+    mon = Monitor([fake.sonar, proximity, fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 36)
+    assert mon.state is State.PRESENT
+    proximity.read = lambda: GONE
+    assert run_for(fake, mon, 15) is not None
+    assert mon.state is State.AWAY
+
+
+def test_a_poll_sensor_saying_nobody_is_here_does_not_look_while_away():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    mon = Monitor([gone_sensor(), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 30)
+    assert mon.state is State.AWAY
+    looks = fake.looks
+    run_for(fake, mon, 120)
+    assert fake.looks == looks
+
+
+def test_a_poll_sensor_that_keeps_seeing_someone_the_camera_does_not_backs_off():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    seeing = Sensor("proximity", "poll", lambda: GONE)
+    mon = Monitor([seeing, fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 30)
+    assert mon.state is State.AWAY
+    looks = fake.looks
+    seeing.read = lambda: MOVING  # someone beside the desk, say
+    run_for(fake, mon, 300)
+    assert fake.looks - looks <= 300 / 30 + 2
+
+
+def test_motion_while_away_never_looks_more_often_than_recheck_after():
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    fake.reading = QUIET
+    mon = Monitor([fake.sonar, fake.camera], 5.0, 60.0, clock=fake.clock)
+    run_for(fake, mon, 120)
+    assert mon.state is State.AWAY
+    looks = fake.looks
+    fake.reading = MOVING
+    run_for(fake, mon, 120)
+    assert fake.looks - looks <= 120 / 60 + 1
+
+
+@pytest.mark.parametrize("seen, max_looks", [(FACE, 120 / 30 + 1), (EMPTY, 120 / 10 + 1)])
+def test_a_flickering_poll_sensor_does_not_blink_the_camera(seen, max_looks):
+    # someone at the edge of the presence sensor's range: 1, 0, 1, 0...
+    fake, _ = monitor()
+    fake.seen = seen
+    flicker = iter([MOVING, GONE] * 100)
+    mon = Monitor([Sensor("proximity", "poll", lambda: next(flicker)), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 120)
+    assert mon.state is State.PRESENT
+    assert fake.looks <= max_looks
+
+
+def test_the_look_that_finds_someone_back_counts_toward_the_next():
+    # sitting down at the edge of the presence sensor's range: present, absent...
+    fake, _ = monitor()
+    fake.seen = EMPTY
+    readings = iter([GONE] * 12 + [MOVING, GONE] * 20)
+    mon = Monitor([Sensor("proximity", "poll", lambda: next(readings)), fake.camera], 30.0, 10.0, clock=fake.clock)
+    run_for(fake, mon, 36)
+    assert mon.state is State.AWAY
+    fake.seen = FACE
+    looks = fake.looks
+    run_for(fake, mon, 9)
+    assert mon.state is State.PRESENT
+    assert fake.looks - looks == 1
+
+
+def keeping(look_every=120.0):
+    fake = Fake()
+    return fake, Monitor([fake.sonar, fake.camera], 30.0, 10.0, clock=fake.clock, look_every=look_every)
+
+
+def test_a_fidgeter_is_looked_at_soon_after_the_last_input_then_now_and_again():
+    fake, mon = keeping()
+    run_for(fake, mon, 29)
+    assert fake.looks == 0
+    run_for(fake, mon, 3)
+    assert fake.looks == 1
+    assert mon.attended
+    run_for(fake, mon, 117)
+    assert fake.looks == 1
+    run_for(fake, mon, 3)
+    assert fake.looks == 2
+
+
+def test_the_first_look_is_no_later_than_the_look_interval():
+    fake, mon = keeping(look_every=15.0)
+    run_for(fake, mon, 18)
+    assert fake.looks == 1
+
+
+def test_without_keeping_awake_motion_never_brings_a_look():
+    fake, mon = keeping(look_every=None)
+    run_for(fake, mon, 600)
+    assert fake.looks == 0
+    assert not mon.attended
+
+
+def test_without_keeping_awake_a_face_is_not_attended():
+    fake, mon = keeping(look_every=None)
+    fake.reading = QUIET
+    run_for(fake, mon, 36)
+    assert fake.looks == 1
+    assert not mon.attended
+
+
+@pytest.mark.parametrize("seen", [EMPTY, BLIND], ids=["empty", "blind"])
+def test_a_missed_forced_look_is_tried_once_more_and_does_not_lead_to_away(seen):
+    fake, mon = keeping()
+    fake.seen = seen
+    run_for(fake, mon, 33)
+    assert fake.looks == 1
+    assert mon.missed_at is None and mon.blind_at is None
+    run_for(fake, mon, 12)
+    assert fake.looks == 2
+    run_for(fake, mon, 100)
+    assert fake.looks == 2
+    assert mon.state is State.PRESENT
+    assert not mon.attended
+
+
+def test_motion_alone_never_counts_as_attended():
+    fake, mon = keeping()
+    fake.seen = EMPTY
+    run_for(fake, mon, 1200)
+    assert not mon.attended
+    assert mon.state is State.PRESENT
+
+
+def test_one_missed_look_keeps_attended_but_silence_of_the_camera_ends_it():
+    fake, mon = keeping()
+    run_for(fake, mon, 33)
+    sure = mon.sure_at
+    fake.seen = EMPTY
+    run_for(fake, mon, 135)
+    assert mon.attended
+    fake.now = sure + 310.0
+    assert not mon.attended
+
+
+def test_a_look_in_the_quiet_path_counts():
+    fake, mon = monitor()
+    mon.look_every = 120.0
+    fake.reading = QUIET
+    run_for(fake, mon, 36)
+    assert mon.attended
+
+
+def test_a_look_that_brings_the_user_back_counts():
+    fake, mon = keeping()
+    mon.state = State.AWAY
+    fake.reading, fake.seen = QUIET, EMPTY
+    run_for(fake, mon, 6)
+    fake.reading, fake.seen = MOVING, FACE
+    run_for(fake, mon, 3)
+    assert mon.state is State.PRESENT
+    assert mon.attended
+
+
+def test_going_away_ends_attended():
+    fake, mon = keeping()
+    run_for(fake, mon, 33)
+    fake.reading, fake.seen = QUIET, EMPTY
+    run_for(fake, mon, 60)
+    assert mon.state is State.AWAY
+    assert not mon.attended
+
+
+def test_a_restart_or_a_hold_ends_attended():
+    fake, mon = keeping()
+    run_for(fake, mon, 33)
+    assert mon.attended
+    mon.freeze()
+    assert not mon.attended
+    mon.hold.clear()
+    assert mon.attended
+    mon.restart()
+    assert not mon.attended
+
+
+def test_no_camera_is_never_attended_and_never_looks():
+    fake = Fake()
+    mon = Monitor([fake.sonar], 30.0, 10.0, clock=fake.clock, look_every=120.0)
+    run_for(fake, mon, 600)
+    assert not mon.attended
+
+
+def test_attended_always_rests_on_a_recent_face():
+    rng = random.Random(7)
+    for _ in range(300):
+        fake, mon = keeping()
+        faces = []
+        for _ in range(300):
+            fake.reading = rng.choice([MOVING, QUIET, MOVING, MUTED])
+            fake.seen = rng.choice([FACE, EMPTY, EMPTY, BLIND])
+            looks = fake.looks
+            mon.step()
+            if fake.looks > looks and fake.seen is FACE:
+                faces.append(fake.now)
+            if rng.random() < 0.02:
+                mon.active()
+                faces.clear()
+            fake.now += INTERVAL
+            if mon.attended:
+                assert mon.state is State.PRESENT
+                assert faces and fake.now - faces[-1] < 310.0
+
+
+@pytest.mark.parametrize("left_at", [150.0, 153.0], ids=["as a forced look comes due", "after a forced look"])
+def test_keeping_awake_barely_slows_a_sensor_that_says_nobody_is_here(left_at):
+    def away_after_leaving(look_every):
+        fake, mon = keeping(look_every)
+        run_for(fake, mon, left_at)
+        fake.reading, fake.seen = GONE, EMPTY
+        return run_for(fake, mon, 90) - left_at
+
+    assert away_after_leaving(120.0) <= away_after_leaving(None) + 10.0
+
+
+def test_a_quiet_look_overrides_a_pending_retry():
+    fake, mon = keeping()
+    run_for(fake, mon, 6)
+    fake.reading, fake.seen = QUIET, EMPTY
+    run_for(fake, mon, 27)  # sonar quiet since 6; the forced look at 30 misses
+    fake.seen = FACE
+    run_for(fake, mon, 6)  # quiet long enough at 36 for the quiet path to look
+    assert mon.retry_at is None
+
+
+def test_a_retry_does_not_let_attended_lapse_before_the_next_look():
+    fake = Fake()
+    mon = Monitor([fake.sonar, fake.camera], 30.0, 30.0, clock=fake.clock, look_every=10.0)
+    run_for(fake, mon, 15)
+    assert mon.attended
+    fake.seen = EMPTY
+    run_for(fake, mon, 12)  # the forced look misses; its retry is 30 s off
+    fake.seen = FACE
+    attended = []
+    for _ in range(14):
+        attended.append(mon.attended)
+        mon.step()
+        fake.now += INTERVAL
+    assert all(attended)
+
+
+def test_a_look_can_be_asked_for_at_once_and_a_miss_is_retried():
+    fake, mon = keeping()
+    run_for(fake, mon, 12)
+    mon.look_soon()
+    fake.seen = EMPTY
+    run_for(fake, mon, 3)
+    assert fake.looks == 1
+    assert mon.retry_at is not None
+
+
+def test_a_locked_screen_gets_no_forced_looks():
+    fake, mon = keeping()
+    mon.force_looks = False
+    mon.look_soon()
+    run_for(fake, mon, 600)
+    assert fake.looks == 0
+
+
+def test_a_hold_lasts_as_long_as_a_face_counts():
+    fake, mon = keeping()
+    assert mon.keep_for == 310.0
+    run_for(fake, mon, 33)
+    fake.now = mon.sure_at + mon.keep_for - 1
+    assert mon.attended

@@ -24,6 +24,8 @@ class Sensing:
     recheck_after: float = 10.0  # seconds between the two empty looks that mean away
     interval: float = 3.0  # seconds between sonar probes
     respect_idle_inhibitors: bool = True  # while a video plays, sense nothing and change nothing
+    keep_awake: bool = True  # hold the desktop's idle timers off while a face is in view
+    keep_awake_every: float = 120.0  # seconds between camera looks while there is motion but no input
 
 
 @dataclass
@@ -45,6 +47,12 @@ class Camera:
 
 
 @dataclass
+class Proximity:
+    enabled: bool = True
+    device: str = ""  # IIO device, as iio:deviceN or a path; empty: the first one named prox
+
+
+@dataclass
 class Wake:
     enabled: bool = False  # keep sensing while locked, and wake the screen when someone comes
     command: str = ""  # shell command that wakes the screen; empty: a nudge of a virtual mouse
@@ -61,6 +69,7 @@ class Config:
     sensing: Sensing = field(default_factory=Sensing)
     sonar: Sonar = field(default_factory=Sonar)
     camera: Camera = field(default_factory=Camera)
+    proximity: Proximity = field(default_factory=Proximity)
     wake: Wake = field(default_factory=Wake)
     actions: Actions = field(default_factory=Actions)
 
@@ -75,6 +84,7 @@ LIMITS = {
     "sensing.quiet_for": (1.0, None),
     "sensing.recheck_after": (0.0, None),
     "sensing.interval": (0.5, 60.0),
+    "sensing.keep_awake_every": (10.0, None),
     "sonar.tone_hz": (15000.0, 23500.0),  # below is audible to most people, above aliases at 48 kHz
     "sonar.burst": (1.0, 10.0),  # shorter leaves too little steady tone to measure
     "sonar.threshold_db": (-80.0, 0.0),
@@ -139,6 +149,12 @@ interval = {sensing.interval:g}
 # players do during playback, sense nothing and leave the state as it is. Your
 # desktop itself would not blank or lock the screen then either.
 respect_idle_inhibitors = {idle_inhibitors}
+# Hold the desktop's dimming, locking and suspending off while the camera sees
+# you, since it only counts keyboard and mouse. Motion alone does not hold it off.
+keep_awake = {keep_awake}
+# Seconds between camera looks while there is no input. The first comes sooner,
+# after quiet_for if that is shorter. The camera LED lights each time.
+keep_awake_every = {sensing.keep_awake_every:g}
 
 [sonar]
 enabled = {sonar_enabled}
@@ -156,6 +172,14 @@ device = {device}
 score_threshold = {camera.score_threshold:g}
 # Faces narrower than this share of the frame are too far away to count.
 min_face_width = {camera.min_face_width:g}
+
+[proximity]
+# The laptop's own human presence sensor, if it has one that Linux exposes
+# (hid-sensor-prox). It sees someone sitting still, so the camera rarely needs to.
+enabled = {proximity_enabled}
+# Empty (best): the first IIO device named prox. iio:deviceN or its path in
+# /sys work too, but the N can change between boots.
+device = {proximity_device}
 
 [wake]
 # Keep sensing while the screen is locked, and wake the screen when someone
@@ -182,8 +206,11 @@ def render(config):
         camera=config.camera,
         actions=config.actions,
         idle_inhibitors=str(config.sensing.respect_idle_inhibitors).lower(),
+        keep_awake=str(config.sensing.keep_awake).lower(),
         sonar_enabled=str(config.sonar.enabled).lower(),
         camera_enabled=str(config.camera.enabled).lower(),
+        proximity_enabled=str(config.proximity.enabled).lower(),
+        proximity_device=json.dumps(config.proximity.device),
         wake_enabled=str(config.wake.enabled).lower(),
         wake_command=json.dumps(config.wake.command),
         # JSON strings are valid TOML basic strings, escapes included

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .sensor import Reading, Verdict
+
 log = logging.getLogger("presenced")
 
 RATE = 48000
@@ -179,13 +181,40 @@ def analyze(samples, tone_hz):
 
 
 class Sonar:
-    def __init__(self, tone_hz=20000.0, burst_s=1.4, speaker="speaker", microphone="digital microphone"):
+    name = "sonar"
+    role = "poll"
+
+    def __init__(
+        self, tone_hz=20000.0, burst_s=1.4, speaker="speaker", microphone="digital microphone", threshold_db=-28.0
+    ):
         self.abort = threading.Event()  # set to cut a tone short when sensing is held off
         self.tone_hz = tone_hz
+        self.threshold_db = threshold_db
         self.speaker = speaker
         self.microphone = microphone
         self.tone = make_tone(tone_hz, burst_s)
-        self.found = (None, None)  # the node names the hints last matched
+        self.found = None  # the node names the hints last matched; None before the first look-up
+
+    def hold(self):
+        self.abort.set()
+
+    def release(self):
+        self.abort.clear()
+
+    def describe(self):
+        speaker, microphone = self.found or self.nodes()
+        return (
+            f"speaker {speaker or f'{self.speaker!r} not found'},"
+            f" microphone {microphone or f'{self.microphone!r} not found'}"
+        )
+
+    def read(self):
+        reading = self.probe()
+        if not reading.usable:
+            verdict = Verdict.UNKNOWN
+        else:
+            verdict = Verdict.PRESENT if reading.motion_db > self.threshold_db else Verdict.QUIET
+        return Reading(verdict, {"level_db": reading.level_db, "motion_db": reading.motion_db})
 
     def nodes(self):
         """Current speaker and microphone node names; either is None if missing."""
@@ -259,18 +288,3 @@ class Sonar:
 def player_command(sink):
     return ["pw-play", *STREAM, "--target", sink, "-P", PLAYBACK_PROPERTIES, "-"]
 
-
-class NoSonar:
-    """Stands in when the sonar is turned off."""
-
-    speaker = microphone = "disabled"
-
-    def __init__(self):
-        self.abort = threading.Event()
-    found = ("disabled", "disabled")
-
-    def nodes(self):
-        return self.found
-
-    def probe(self):
-        return UNUSABLE

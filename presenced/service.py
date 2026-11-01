@@ -22,9 +22,12 @@ from . import __version__
 from .config import ConfigError, load
 from .controls import Controls
 from .desktop import Desktop, call
-from .ir import IRCamera, NoCamera
+from .ir import IRCamera
+from .keep import Keeper
 from .monitor import Monitor, State
-from .sonar import NoSonar, Sonar
+from .proximity import ProximitySensor
+from .sensor import Verdict
+from .sonar import Sonar
 from .wake import Waker
 
 log = logging.getLogger("presenced")
@@ -39,6 +42,7 @@ FAILING_FOR_S = 60.0  # how long ticks may keep failing before presenced exits f
 EXIT_CONFIG = 2  # a bad configuration: restarting will not help
 EXIT_TAKEN = 3  # another presenced owns the bus name: restarting will not help either
 ACTION_TIMEOUT_S = 60.0  # an action still running after this long is killed
+IDLE_RESET_SLACK_S = 1.0  # input this soon after the desktop restarted its idle count is put down to the restart
 
 
 class PresenceInterface(ServiceInterface):
@@ -132,12 +136,13 @@ class Daemon:
         self.failing_since = None
         self.exit_code = 0
         self.clock = time.monotonic
+        self.was_inhibited = False
+        self.idle_reset_at = None  # when the desktop last restarted its idle count by itself
+        self.keeper = None
+        self.was_holding = False
         self.monitor = monitor or Monitor(
-            make_sonar(config.sonar),
-            make_camera(config.camera),
-            config.sonar.threshold_db,
-            config.sensing.quiet_for,
-            config.sensing.recheck_after,
+            make_sensors(config), config.sensing.quiet_for, config.sensing.recheck_after,
+            look_every=config.sensing.keep_awake_every if config.sensing.keep_awake else None,
         )
         self.monitor.on_change = self.state_changed
         self.waker = waker or Waker(config.wake.command)
@@ -210,10 +215,8 @@ class Daemon:
     def hold_now(self):
         """Freeze the state at once, and stop a check under way from using the speaker or camera."""
         self.monitor.freeze()
-        self.monitor.sonar.abort.set()
-        camera = self.monitor.camera
-        with camera.gate:
-            camera.abort.set()
+        for sensor in self.monitor.sensors:
+            sensor.hold()
 
     async def step_finished(self, result=None):
         """result, once no check is under way any more."""
@@ -239,9 +242,10 @@ class Daemon:
             return False
         if self.monitor.hold.is_set():
             self.monitor.hold.clear()
-            self.monitor.sonar.abort.clear()
-            self.monitor.camera.abort.clear()
+            for sensor in self.monitor.sensors:
+                sensor.release()
             self.monitor.restart()  # whatever was counted before the hold is stale now
+            self.monitor.look_soon()
         return True
 
     def pause(self, seconds):
@@ -275,20 +279,15 @@ class Daemon:
             "state": Variant("s", monitor.state.value),
             "sensing": Variant("s", self.mode),
             "quiet_seconds": Variant("d", monitor.quiet_seconds),
-            "speaker": Variant("s", monitor.sonar.found[0] or f"{monitor.sonar.speaker} (not found)"),
-            "microphone": Variant("s", monitor.sonar.found[1] or f"{monitor.sonar.microphone} (not found)"),
-            "camera": Variant("s", monitor.camera.device),
+            "sensors": Variant("a{sv}", {
+                sensor.name: Variant("a{sv}", sensor_status(sensor, monitor.readings.get(sensor.name)))
+                for sensor in monitor.sensors
+            }),
+            "keeping_awake": Variant("b", bool(self.keeper and self.keeper.held)),
             "version": Variant("s", __version__),
         }
         if self.idle_seconds is not None:
             status["idle_seconds"] = Variant("d", self.idle_seconds)
-        if monitor.last_sonar is not None:
-            status["sonar_level_db"] = Variant("d", monitor.last_sonar.level_db)
-            status["sonar_motion_db"] = Variant("d", monitor.last_sonar.motion_db)
-            status["sonar_usable"] = Variant("b", monitor.last_sonar.usable)
-        if monitor.last_look is not None:
-            status["face_score"] = Variant("d", monitor.last_look.score)
-            status["camera_blind"] = Variant("b", monitor.last_look.blind)
         if self.last_error:
             status["last_error"] = Variant("s", self.last_error)
         return status
@@ -305,6 +304,9 @@ class Daemon:
             and message.sender == "org.freedesktop.DBus"
         ):
             name, _, new_owner = message.body
+            self.desktop.owner_changed(name)
+            if self.keeper:
+                self.keeper.lost(name)
             if not new_owner and self.controls.release_owner(name):
                 log.info("inhibitors of %s released: it left the bus", name)
                 self.controls_changed()
@@ -316,7 +318,19 @@ class Daemon:
         try:
             await self.sense()
         finally:
+            await self.keep_awake()
             self.stepping.set()
+
+    async def keep_awake(self):
+        if not self.keeper or self.mode == "held":
+            # held: another program's inhibitor. Ours stays, as giving it back could lock someone
+            # seen a moment ago, but goes unrenewed: if that "program" is really our own
+            # inhibitor misread, the deadline ends it
+            return
+        await self.keeper.want(self.monitor.attended and self.mode == "sensing")
+        if self.keeper.held != self.was_holding:
+            self.was_holding = self.keeper.held
+            self.desktop.holding(self.was_holding)
 
     async def sense(self):
         offset = self.boot_offset()
@@ -324,6 +338,7 @@ class Daemon:
             log.info("resumed from suspend")
             self.monitor.restart()
         self.sleep_offset = offset
+        silent_since = await self.desktop.watch_input()  # before any hold: it must be in place when input comes
 
         if self.controls.paused != self.last_paused:
             self.controls_changed()  # a timed pause ran out
@@ -342,7 +357,17 @@ class Daemon:
             # below can hold the state, or it would be lost
             self.monitor.active()
 
-        if not locked and self.config.sensing.respect_idle_inhibitors and await self.desktop.idle_inhibited():
+        must_know = self.config.sensing.respect_idle_inhibitors and not locked
+        try:
+            inhibited = await self.desktop.idle_inhibited()
+        except TimeoutError:
+            if must_know:
+                raise
+            inhibited = self.was_inhibited
+        if self.was_inhibited and not inhibited:
+            self.idle_reset_at = self.clock()
+        self.was_inhibited = inhibited
+        if inhibited and must_know:
             # a video is playing, say: the desktop will not blank or lock, and neither should we
             self.hold("held")
             return
@@ -352,18 +377,37 @@ class Daemon:
             return
 
         self.idle_seconds = await self.desktop.idle_seconds()
-        if self.idle_seconds is not None and self.idle_seconds < self.config.sensing.start_after_idle:
+        if self.recent_input(silent_since):
             self.set_mode("input")
             self.monitor.active()
             return
 
         self.set_mode("watching" if locked else "sensing")
         before = self.monitor.state
+        self.monitor.force_looks = not locked
         await asyncio.to_thread(self.monitor.step)
         seen = self.monitor.last_look
-        if locked and before is State.AWAY and self.monitor.state is State.PRESENT and seen and seen.faces:
+        if (
+            locked and before is State.AWAY and self.monitor.state is State.PRESENT
+            and seen and seen.verdict is Verdict.PRESENT
+        ):
             log.info("someone came back: waking the screen")
             await self.waker.wake()
+
+    def recent_input(self, silent_since):
+        """Whether the idle time means someone touched the laptop, not that an idle inhibitor ended.
+
+        Mutter restarts its idle count when the last inhibitor goes, without any
+        input. An event no watch fired for was that; with no watch, the timing has to tell.
+        """
+        idle = self.idle_seconds
+        if idle is None or idle >= self.config.sensing.start_after_idle:
+            return False
+        last_event = self.clock() - idle
+        if silent_since is not None:
+            return last_event <= silent_since
+        resets = [at for at in (self.idle_reset_at, self.keeper and self.keeper.released_at) if at is not None]
+        return not resets or last_event > max(resets) + IDLE_RESET_SLACK_S
 
     async def safe_tick(self):
         """A tick that logs what went wrong instead of ending the daemon, unless it keeps failing."""
@@ -396,8 +440,11 @@ class Daemon:
         session = await MessageBus(bus_type=BusType.SESSION).connect()
         system = await MessageBus(bus_type=BusType.SYSTEM).connect()
         self.desktop = Desktop(session, system)
+        if self.config.sensing.keep_awake:
+            self.keeper = Keeper(session, self.monitor.keep_for)
         self.interface = PresenceInterface(self)
         session.add_message_handler(self.on_message)
+        session.add_message_handler(self.desktop.on_message)
         session.export(OBJECT_PATH, self.interface)
         await call(
             session, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
@@ -409,10 +456,10 @@ class Daemon:
             return EXIT_TAKEN
 
         log.info("presenced %s", __version__)
-        speaker, microphone = self.monitor.sonar.nodes()
-        log.info("speaker %s", speaker or f"{self.monitor.sonar.speaker!r} not found")
-        log.info("microphone %s", microphone or f"{self.monitor.sonar.microphone!r} not found")
-        log.info("camera %s", self.monitor.camera.device)
+        for sensor in self.monitor.sensors:
+            log.info("%s: %s", sensor.name, sensor.describe())
+        if not self.monitor.sensors:
+            log.warning("no sensors: only input and unlocking count")
         actions = asyncio.ensure_future(self.run_actions())
         for bus, name in ((session, "session"), (system, "system")):
             asyncio.ensure_future(bus.wait_for_disconnect()).add_done_callback(
@@ -448,21 +495,49 @@ class Daemon:
         self.stop.set()
 
 
+def make_sensors(config):
+    sensors = (make_sonar(config.sonar), make_proximity(config.proximity), make_camera(config.camera))
+    return [sensor for sensor in sensors if sensor]
+
+
 def make_sonar(config):
     if not config.enabled:
-        return NoSonar()
-    return Sonar(config.tone_hz, config.burst, config.speaker, config.microphone)
+        return None
+    return Sonar(config.tone_hz, config.burst, config.speaker, config.microphone, config.threshold_db)
+
+
+def make_proximity(config):
+    """The laptop's presence sensor, or None if it is turned off or there is none."""
+    if not config.enabled:
+        return None
+    try:
+        return ProximitySensor(config.device)
+    except LookupError as error:
+        # most laptops have none, so only a configured one missing is worth a warning
+        (log.warning if config.device else log.info)("no proximity sensor: %s", error)
+        return None
 
 
 def make_camera(config):
-    """The IR camera, or a stand-in if it is turned off or cannot be used."""
+    """The IR camera, or None if it is turned off or cannot be used."""
     if not config.enabled:
-        return NoCamera()
+        return None
     try:
         return IRCamera(config.device, config.score_threshold, config.min_face_width)
     except (LookupError, FileNotFoundError, OSError, subprocess.SubprocessError, cv2.error) as error:
-        log.warning("no camera, sensing with the sonar alone: %s", error)
-        return NoCamera()
+        log.warning("no camera: %s", error)
+        return None
+
+
+def sensor_status(sensor, reading):
+    """A sensor's latest verdict and numbers, as D-Bus variants."""
+    values = {"device": sensor.describe()}
+    if reading is not None:
+        values = {**values, "verdict": reading.verdict.value, **reading.detail}
+    def signature(value):  # bool before int, since a bool is an int
+        return next(sig for kind, sig in ((bool, "b"), (int, "i"), (float, "d"), (str, "s")) if isinstance(value, kind))
+
+    return {key: Variant(signature(value), value) for key, value in values.items()}
 
 
 def kill_group(process):

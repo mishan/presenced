@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from presenced import ir
+from presenced.sensor import Verdict
 
 LISTING = """ioctl: VIDIOC_ENUM_FMT
 \t[0]: 'GREY' (8-bit Greyscale)
@@ -37,7 +38,7 @@ def test_no_ir_camera_falls_back_to_sonar_alone(monkeypatch):
     from presenced.service import make_camera
 
     monkeypatch.setattr(ir.glob, "glob", lambda pattern: [])
-    assert isinstance(make_camera(Camera()), ir.NoCamera)
+    assert make_camera(Camera()) is None
 
 
 def test_a_stalled_camera_does_not_block_forever():
@@ -128,4 +129,18 @@ def test_a_corrupt_model_falls_back_to_sonar_alone(monkeypatch):
         raise cv2.error("failed to parse the model")
 
     monkeypatch.setattr(service, "IRCamera", corrupt)
-    assert isinstance(service.make_camera(Camera()), ir.NoCamera)
+    assert service.make_camera(Camera()) is None
+
+
+@pytest.mark.parametrize(
+    "seen, verdict",
+    [
+        (ir.IRReading(1, 0.9, 20.0, False), Verdict.PRESENT),
+        (ir.IRReading(0, 0.4, 20.0, False), Verdict.ABSENT),
+        (ir.IRReading(0, 0.0, 0.0, True), Verdict.UNKNOWN),
+    ],
+)
+def test_a_face_is_presence_and_a_blind_camera_cannot_tell(seen, verdict):
+    cam = ir.IRCamera.__new__(ir.IRCamera)
+    cam.look = lambda: seen
+    assert cam.read().verdict is verdict
