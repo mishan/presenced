@@ -1,0 +1,22 @@
+#!/v/bin/python
+"""What the microphones would hear: the tone, wandering if /tmp/rig-scene says something moves."""
+import signal
+import sys
+
+import numpy as np
+
+RATE, LEAD_S, BURST_S, TONE_HZ = 48000, 0.3, 1.4, 20000
+t = np.arange(int(RATE * BURST_S)) / RATE
+moving = open("/tmp/rig-scene").read().split()[1] == "moving"
+wander = 0.6 * np.sin(2 * np.pi * 3 * t) if moving else 0.0
+tone = 0.2 * np.sin(2 * np.pi * TONE_HZ * t + wander)
+tone += np.random.default_rng().normal(0, 0.0005, len(t))
+ramp = int(0.1 * RATE)
+tone[:ramp] *= np.linspace(0, 1, ramp)
+tone[-ramp:] *= np.linspace(1, 0, ramp)
+lead = np.zeros(int(RATE * LEAD_S))
+mono = (np.concatenate([lead, tone, lead]) * 32767).astype("<i2")
+sys.stdout.buffer.write(np.repeat(mono[:, None], 2, axis=1).tobytes())
+sys.stdout.buffer.flush()
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+signal.pause()

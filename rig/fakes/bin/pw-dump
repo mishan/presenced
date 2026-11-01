@@ -1,0 +1,12 @@
+#!/v/bin/python
+"""PipeWire with a laptop's speaker and microphone, and nothing else."""
+import json
+
+nodes = (("Audio/Sink", "rig-speaker", "Speaker"), ("Audio/Source", "rig-mic", "Digital Microphone"))
+print(json.dumps([
+    {"id": number, "info": {"props": {
+        "media.class": media_class, "node.name": name, "node.description": description,
+        "device.api": "alsa", "device.bus": "pci",
+    }}}
+    for number, (media_class, name, description) in enumerate(nodes)
+]))

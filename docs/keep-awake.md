@@ -268,8 +268,22 @@ lock, a video comes and goes, motion alone lets the desktop's own lock return, a
 leaving locks through `on_away` and stays away. GNOME also gets real pointer input
 through Mutter's RemoteDesktop. GNOME Shell only offers a lock if it finds GDM on
 the system bus, so `rig/standins/gdm.py` stands in. Xfce sets no `LockedHint`, so
-there only `GetActive` shows a lock. Containers cannot suspend, so that remains to
-be shown.
+there only `GetActive` shows a lock.
+
+`rig/run.sh gnome sensors` runs the real sonar and camera code, down to the commands
+they run: `rig/fakes` stands in for `v4l2-ctl` and the `pw-` tools, so the real face
+detector and sonar analysis judge scenes it plays. The fake camera clips a face to
+white until the metering region is written and the exposure catches up, as the
+real one does, so that code has to work. The face in `rig/fakes/face.png`
+is NASA's public domain portrait of Eileen Collins, as shipped with scikit-image.
+
+gsd-power will not suspend in a container or a VM, so `rig/run.sh gnome idle` sets
+its idle action to logging out, which waits behind the same idle inhibitor: the hold
+keeps it off, and it runs once the hold lapses. Past that gate the two differ: each
+has its own inhibitor flag and way out, and what logind and the kernel do is outside
+presenced, and is covered only by real laptops. So is everything
+physical: whether the emitter reaches a face in a real room, and how ultrasound
+really comes back.
 
 ## Decisions
 

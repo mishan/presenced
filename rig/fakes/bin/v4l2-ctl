@@ -1,0 +1,42 @@
+#!/v/bin/python
+"""An IR camera with no hardware: the emitter strobes, and /tmp/rig-scene says what it lights.
+
+Like the real one it meters on the whole frame, so a face comes out clipped to white
+until the metering region is written, and then for some frames more while the exposure
+catches up. Only code that does both ever sees the face.
+"""
+import os
+import sys
+
+import cv2
+import numpy as np
+
+WIDTH, HEIGHT = 640, 360
+METERED = "/tmp/rig-metered"
+CATCHING_UP = 14  # frames: more than the 12 of a look that does not wait
+args = sys.argv[1:]
+if "--list-formats-ext" in args:
+    print(f"'GREY'\n\tSize: Discrete {WIDTH}x{HEIGHT}")
+elif "--list-ctrls" in args:
+    print("region_of_interest_rectangle")
+elif "--set-ctrl" in args:
+    open(METERED, "w").close()
+elif "--stream-mmap" in args:
+    if os.path.exists(METERED):
+        os.remove(METERED)
+    lit = np.full((HEIGHT, WIDTH), 60, np.uint8)
+    clipped = lit.copy()
+    if open("/tmp/rig-scene").read().split()[0] == "face":
+        face = cv2.imread("/repo/rig/fakes/face.png", cv2.IMREAD_GRAYSCALE)
+        face = cv2.resize(face, (face.shape[1] * 300 // face.shape[0], 300))
+        left = (WIDTH - face.shape[1]) // 2
+        lit[30:330, left:left + face.shape[1]] = face
+        clipped[30:330, left:left + face.shape[1]] = 255
+    unlit = np.full((HEIGHT, WIDTH), 20, np.uint8)
+    metered_for = 0
+    while True:
+        sys.stdout.buffer.write(unlit.tobytes())
+        sys.stdout.buffer.flush()
+        metered_for += 2 if os.path.exists(METERED) else 0
+        sys.stdout.buffer.write((lit if metered_for >= CATCHING_UP else clipped).tobytes())
+        sys.stdout.buffer.flush()

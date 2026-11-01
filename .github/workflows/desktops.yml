@@ -19,6 +19,8 @@ jobs:
         check: [contract, stay, leave]
         include:
           - {desktop: sway, check: contract}
+          - {desktop: gnome, check: sensors}
+          - {desktop: gnome, check: idle}
     steps:
       - uses: actions/checkout@v5
       - run: rig/run.sh ${{ matrix.desktop }} ${{ matrix.check }}

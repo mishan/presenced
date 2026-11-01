@@ -2,6 +2,10 @@
 # Check presenced against a real desktop in a container:
 #   rig/run.sh gnome|kde|xfce|sway           what the desktop does with our inhibitor
 #   rig/run.sh gnome|kde|xfce stay|leave     the whole daemon, with the desktop's idle lock set short
+#   rig/run.sh gnome sensors                 and with the real sonar and camera code
+#   rig/run.sh gnome idle                    a hold against gsd-power's idle action. Logging
+#                                            out stands in for suspending, which it will not do
+#                                            here, or in a VM, and passes the same inhibitor gate
 #
 # systemd runs as PID 1, without --privileged, so logind and the user manager are
 # real; a session is started through PAM, as a display manager would.
@@ -16,7 +20,9 @@ type=wayland
 [ "$desktop" = xfce ] && type=x11
 lock_after=60  # KDE and Xfce count this in whole minutes
 [ "$desktop" = gnome ] && lock_after=30
-[ "$check" = leave ] && lock_after=600  # far off: only on_away may lock
+case $check in leave|sensors|idle) lock_after=600 ;; esac  # far off: only on_away may lock
+idle_action=
+[ "$check" = idle ] && idle_action=30
 if [ "$check" = contract ]; then
     command="/v/bin/python /repo/rig/contract.py $desktop"
     lock_after=
@@ -47,7 +53,7 @@ fi
 docker exec "$name" systemd-run --unit=rig --collect -p User=u -p PAMName=login -p WorkingDirectory=/home/u \
     -p Environment=XDG_SESSION_TYPE="$type" -p Environment=XDG_SESSION_CLASS=user \
     -p Environment=XDG_SESSION_DESKTOP="$desktop" -p Environment=PYTHONDONTWRITEBYTECODE=1 \
-    -p Environment=LOCK_AFTER_S="$lock_after" \
+    -p Environment=LOCK_AFTER_S="$lock_after" -p Environment=IDLE_ACTION_S="$idle_action" \
     -p StandardOutput=file:/tmp/rig.out -p StandardError=file:/tmp/rig.out \
     bash -c "bash /repo/rig/sessions/$desktop.sh && $command > /tmp/rig.json 2>/tmp/rig.err; echo \$? > /tmp/rig.status" >/dev/null
 for _ in $(seq 1 420); do
